@@ -17,6 +17,7 @@ import functools
 import hashlib
 import io
 import itertools
+import logging
 import lzma
 import os
 import re
@@ -1561,7 +1562,6 @@ async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
         log.warning("Библиотека 'wcwidth' не найдена. Выравнивание колонок может быть неточным.")
         wcswidth = len
 
-    # if "-100" not in str(chat_id): log.warning("Возможно личный чат, ссылки могут быть не действительны!")
     if chat_id >= 0:
         log.warning("Возможно личный чат, ссылки могут быть не действительны!")
     public_chat_id = str(chat_id).removeprefix("-100")
@@ -1659,6 +1659,190 @@ async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
     )
 
 
+def _download_matches_existing(final_path: Path, expected_size: int, expected_mtime: float) -> bool:
+    """Проверяет, лежит ли на диске уже скачанная версия файла.
+
+    Args:
+        final_path: Путь к локальному файлу.
+        expected_size: Ожидаемый размер из БД (допуск 100 байт).
+        expected_mtime: Ожидаемая дата изменения; ``0`` — не проверять
+            (2 сек погрешности для ФС типа FAT32/exFAT).
+
+    Returns:
+        ``True``, если размер и дата совпадают с ожидаемыми.
+    """
+    existing_size = _get_size_safely(final_path)
+    try:
+        existing_mtime = final_path.stat().st_mtime
+    except OSError:
+        existing_mtime = 0
+
+    size_matches = existing_size > 0 and abs(existing_size - expected_size) < 100
+    mtime_matches = expected_mtime == 0 or abs(existing_mtime - expected_mtime) <= 2.0
+    return size_matches and mtime_matches
+
+
+def _clear_tty_line(is_tty: bool) -> None:
+    """Стирает текущую строку терминала (только в TTY)."""
+    if is_tty:
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
+def _render_download_status(is_tty: bool, active: dict[str, int], concurrency: int) -> None:
+    """Перерисовывает строку статуса активных загрузок (только в TTY)."""
+    if not is_tty:
+        return
+
+    parts = []
+    for name in sorted(active.keys()):
+        percent = active[name]
+        short_name = (name[:20] + "..") if len(name) > 23 else name
+        parts.append(f"[{short_name}: {percent}%]")
+
+    status_line = "  ".join(parts)
+
+    sys.stdout.write(f"\r\033[KЗагрузка ({len(active)}/{concurrency} парал.): {status_line}")
+    sys.stdout.flush()
+
+
+def _make_download_progress_callback(
+    is_tty: bool, active: dict[str, int], concurrency: int, filename: str
+) -> Callable[[int, int], None]:
+    """Создаёт callback прогресса pyrogram для одного файла (не чаще 10 Гц)."""
+    last_update_time = 0.0
+
+    def progress(current: int, total: int) -> None:
+        nonlocal last_update_time
+        if total == 0:
+            return
+
+        percent = int(current * 100 / total)
+        now = time.time()
+
+        if is_tty and (percent >= 100 or (now - last_update_time > 0.1)):
+            active[filename] = percent
+            _render_download_status(is_tty, active, concurrency)
+            last_update_time = now
+
+    return progress
+
+
+async def _download_worker(
+    app: Client,
+    download_dir: Path,
+    queue: asyncio.Queue,
+    is_tty: bool,
+    active: dict[str, int],
+    stats: dict[str, int],
+    concurrency: int,
+) -> None:
+    """Воркер очереди скачивания: подготавливает имя и качает файл.
+
+    Args:
+        app: Клиент Telegram.
+        download_dir: Каталог для сохранения файлов чата.
+        queue: Очередь задач ``(message, file_name, expected_size)``.
+        is_tty: Выводить ли живой прогресс в терминал.
+        active: Активные загрузки: имя файла -> процент (общий словарь).
+        stats: Счётчики результата (общий словарь success/skipped/error).
+        concurrency: Число параллельных воркеров (для статус-строки).
+    """
+    while True:
+        try:
+            task_item = await queue.get()
+        except asyncio.CancelledError:
+            return
+
+        message, file_name, expected_size = task_item
+        safe_name = "unknown"
+        final_path = None
+
+        try:
+            # --- 1. Подготовка имени файла ---
+            base_name = file_name if file_name else f"audio_{message.id}"
+            safe_name = _sanitize_filename(base_name)
+
+            # Если расширения нет, пытаемся угадать по mime-type
+            if not Path(safe_name).suffix:
+                mime = None
+                if message.audio:
+                    mime = message.audio.mime_type
+                elif message.document:
+                    mime = message.document.mime_type
+                guessed_ext = app.guess_extension(mime) if mime else None
+                safe_name += guessed_ext if guessed_ext else ".mp3"
+
+            final_path = download_dir / safe_name
+
+            if safe_name in active:
+                safe_name = f"{message.id}_{safe_name}"
+                final_path = download_dir / safe_name
+
+            expected_mtime = message.date.timestamp() if message.date else 0
+
+            should_download = True
+            if final_path.exists():
+                if _download_matches_existing(final_path, expected_size, expected_mtime):
+                    should_download = False
+                else:
+                    safe_name = f"{message.id}_{safe_name}"
+                    final_path = download_dir / safe_name
+                    if final_path.exists() and _download_matches_existing(
+                        final_path, expected_size, expected_mtime
+                    ):
+                        should_download = False
+
+            # --- 2. Выполнение действия ---
+            if not should_download:
+                if not is_tty:
+                    log.debug(f"Файл существует, пропуск: {safe_name}")
+                stats["skipped"] += 1
+            else:
+                active[safe_name] = 0
+                if not is_tty:
+                    log.info(f"Начало загрузки: {safe_name} ({_format_bytes(expected_size)})")
+                else:
+                    _render_download_status(is_tty, active, concurrency)
+
+                progress_callback = _make_download_progress_callback(
+                    is_tty, active, concurrency, safe_name
+                )
+
+                await app.download_media(
+                    message,
+                    file_name=str(final_path),
+                    progress=progress_callback,
+                )
+
+                # --- Установка оригинальной даты изменения файла ---
+                if message.date:
+                    try:
+                        mtime = message.date.timestamp()
+                        os.utime(final_path, (mtime, mtime))
+                    except Exception as e:
+                        log.debug(f"Не удалось обновить дату для файла {safe_name}: {e}")
+
+                if not is_tty:
+                    log.info(f"Успешно скачано: {safe_name}")
+
+                stats["success"] += 1
+
+        except Exception as e:
+            if final_path and final_path.exists():
+                with suppress(OSError):
+                    os.remove(final_path)
+
+            _clear_tty_line(is_tty)
+            log.error(f"Ошибка загрузки {safe_name}: {e}")
+            stats["error"] += 1
+
+        finally:
+            active.pop(safe_name, None)
+            _render_download_status(is_tty, active, concurrency)
+            queue.task_done()
+
+
 async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
     """Скачивает все аудиофайлы из указанного чата в локальную папку downloads.
 
@@ -1675,7 +1859,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
     download_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Папка для сохранения: {download_dir.resolve()}")
 
-    IS_TTY = sys.stdout.isatty()
+    is_tty = sys.stdout.isatty()
 
     async with (
         create_connection() as conn,
@@ -1718,176 +1902,18 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
     # Ограничение одновременных загрузок
     # todo (Проверить на премиуме)
-    DOWNLOAD_CONCURRENCY = 6 if app.me.is_premium else 3
-    queue = asyncio.Queue(maxsize=16)
-
+    download_concurrency = 6 if app.me.is_premium else 3
+    queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+    active: dict[str, int] = {}
     stats = {"success": 0, "skipped": 0, "error": 0}
-    active_downloads: dict[str, int] = {}
-
-    def _clear_line():
-        if IS_TTY:
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
-
-    def display_status():
-        if not IS_TTY:
-            return
-
-        parts = []
-        for name in sorted(active_downloads.keys()):
-            percent = active_downloads[name]
-            short_name = (name[:20] + "..") if len(name) > 23 else name
-            parts.append(f"[{short_name}: {percent}%]")
-
-        status_line = "  ".join(parts)
-
-        sys.stdout.write(
-            f"\r\033[KЗагрузка ({len(active_downloads)}/{DOWNLOAD_CONCURRENCY} парал.): {status_line}"
-        )
-        sys.stdout.flush()
-
-    def create_progress_callback(filename: str):
-        last_update_time = 0
-
-        def progress(current, total):
-            nonlocal last_update_time
-            if total == 0:
-                return
-
-            percent = int(current * 100 / total)
-            now = time.time()
-
-            if IS_TTY and (percent >= 100 or (now - last_update_time > 0.1)):
-                active_downloads[filename] = percent
-                display_status()
-                last_update_time = now
-
-        return progress
-
-    async def worker():
-        """Воркер очереди скачивания: подготавливает имя и качает файл."""
-        while True:
-            try:
-                task_item = await queue.get()
-            except asyncio.CancelledError:
-                return
-
-            message, file_name, expected_size = task_item
-            safe_name = "unknown"
-            final_path = None
-
-            try:
-                # --- 1. Подготовка имени файла ---
-                base_name = file_name if file_name else f"audio_{message.id}"
-                safe_name = _sanitize_filename(base_name)
-
-                path_obj = Path(safe_name)
-                # Если расширения нет, пытаемся угадать по mime-type
-                if not path_obj.suffix:
-                    mime = None
-                    if message.audio:
-                        mime = message.audio.mime_type
-                    elif message.document:
-                        mime = message.document.mime_type
-                    guessed_ext = app.guess_extension(mime) if mime else None
-                    safe_name += guessed_ext if guessed_ext else ".mp3"
-
-                final_path = download_dir / safe_name
-
-                if safe_name in active_downloads:
-                    safe_name = f"{message.id}_{safe_name}"
-                    final_path = download_dir / safe_name
-
-                should_download = True
-                if final_path.exists():
-                    existing_size = _get_size_safely(final_path)
-
-                    try:
-                        existing_mtime = final_path.stat().st_mtime
-                    except OSError:
-                        existing_mtime = 0
-
-                    expected_mtime = message.date.timestamp() if message.date else 0
-
-                    size_matches = existing_size > 0 and abs(existing_size - expected_size) < 100
-                    # 2 сек погрешности для файловых систем типа FAT32/exFAT
-                    mtime_matches = (
-                        expected_mtime == 0 or abs(existing_mtime - expected_mtime) <= 2.0
-                    )
-
-                    if size_matches and mtime_matches:
-                        should_download = False
-                    else:
-                        safe_name = f"{message.id}_{safe_name}"
-                        final_path = download_dir / safe_name
-
-                        if final_path.exists():
-                            existing_size_renamed = _get_size_safely(final_path)
-                            try:
-                                existing_mtime_renamed = final_path.stat().st_mtime
-                            except OSError:
-                                existing_mtime_renamed = 0
-
-                            if (
-                                existing_size_renamed > 0
-                                and abs(existing_size_renamed - expected_size) < 100
-                                and (
-                                    expected_mtime == 0
-                                    or abs(existing_mtime_renamed - expected_mtime) <= 2.0
-                                )
-                            ):
-                                should_download = False
-
-                # --- 3. Выполнение действия ---
-                if not should_download:
-                    if not IS_TTY:
-                        log.debug(f"Файл существует, пропуск: {safe_name}")
-                    stats["skipped"] += 1
-                else:
-                    active_downloads[safe_name] = 0
-                    # --- Скачивание ---
-                    if not IS_TTY:
-                        log.info(f"Начало загрузки: {safe_name} ({_format_bytes(expected_size)})")
-                    else:
-                        display_status()
-
-                    progress_callback = create_progress_callback(safe_name)
-
-                    await app.download_media(
-                        message,
-                        file_name=str(final_path),
-                        progress=progress_callback,
-                    )
-
-                    # --- Установка оригинальной даты изменения файла ---
-                    if message.date:
-                        try:
-                            mtime = message.date.timestamp()
-                            os.utime(final_path, (mtime, mtime))
-                        except Exception as e:
-                            log.debug(f"Не удалось обновить дату для файла {safe_name}: {e}")
-
-                    if not IS_TTY:
-                        log.info(f"Успешно скачано: {safe_name}")
-
-                    stats["success"] += 1
-
-            except Exception as e:
-                if final_path and final_path.exists():
-                    with suppress(OSError):
-                        os.remove(final_path)
-
-                _clear_line()
-                log.error(f"Ошибка загрузки {safe_name}: {e}")
-                stats["error"] += 1
-
-            finally:
-                active_downloads.pop(safe_name, None)
-                display_status()
-                queue.task_done()
 
     # Запуск воркеров
-    workers = [asyncio.create_task(worker()) for _ in range(DOWNLOAD_CONCURRENCY)]
+    workers = [
+        asyncio.create_task(
+            _download_worker(app, download_dir, queue, is_tty, active, stats, download_concurrency)
+        )
+        for _ in range(download_concurrency)
+    ]
 
     # Producer
     chunk_size = 100
@@ -1900,7 +1926,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
             try:
                 messages = await app.get_messages(chat_id, list(chunk_ids))
             except Exception as e:
-                _clear_line()
+                _clear_tty_line(is_tty)
                 log.error(f"Неустранимая ошибка при получении списка сообщений: {e}")
                 continue
 
@@ -1928,9 +1954,9 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
             processed_count += len(chunk_ids)
             if processed_count % 500 == 0:
-                _clear_line()
+                _clear_tty_line(is_tty)
                 log.info(f"--- Обработано метаданных {processed_count}/{total_files} ---")
-                display_status()
+                _render_download_status(is_tty, active, download_concurrency)
 
         await queue.join()
 
@@ -1939,7 +1965,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
 
-    _clear_line()
+    _clear_tty_line(is_tty)
     log.info(
         f"\n{'=' * 20}\nСкачивание завершено.\n"
         f"Успешно: {stats['success']}\n"
@@ -2994,8 +3020,6 @@ _RE_META_PLACEHOLDER = re.compile(
     r"^\s*(?:<\s*unknown\s*>|\[\s*unknown\s*\])\s*$",
     re.IGNORECASE,
 )
-# _RE_HASH_SUFFIX = re.compile(r"[\s_\-]+(?=[A-Z0-9]*\d)[A-Z0-9]{6}$")
-
 # endregion
 
 # region --- Подфункции fuzzy-матчера ---
@@ -3020,7 +3044,6 @@ def _clean_filename(fname: str | None) -> str:
     original = fname
     s = fname
     s = _RE_EXT.sub("", s)
-    # s = _RE_HASH_SUFFIX.sub("", s)
     s = s.lower()
 
     s = _RE_COPY_SUFFIX.sub(" ", s)
@@ -3586,7 +3609,7 @@ def _match_batch(
     matched_scores = final_scores[match_mask].tolist()
     matched_positions = np.flatnonzero(match_mask)
 
-    if log.isEnabledFor(10):
+    if log.isEnabledFor(logging.DEBUG):
         for k in matched_positions:
             s = int(surv_idx[k])
             abs_idx = int(abs_indices[s])
@@ -3783,14 +3806,14 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
         id_to_row,
     ) = _prepare_arrays(sorted_rows)
 
+    # Локальные алиасы конфиг-констант для горячего цикла; NAME_POWER и
+    # SIZE_POWER используются напрямую из конфига (алиас совпал бы с именем).
     BASE_THRESHOLD = FUZZY_THRESHOLD
+    MAX_DIFF = MAX_DURATION_DIFF_SEC
     W_NAME = WEIGHT_NAME
     W_DUR = WEIGHT_DURATION
     W_SIZE = WEIGHT_SIZE
-    MAX_DIFF = MAX_DURATION_DIFF_SEC
-    NAME_PWR = NAME_POWER
     DUR_POWER = DURATION_POWER
-    SZ_POWER = SIZE_POWER
 
     window_ends = np.searchsorted(durations, durations + MAX_DIFF, side="right")
     max_window_size = max(1, int(np.max(window_ends - np.arange(count) - 1)))
@@ -3830,7 +3853,7 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
         "w_name": W_NAME,
         "w_dur": W_DUR,
         "w_size": W_SIZE,
-        "name_power": NAME_PWR,
+        "name_power": NAME_POWER,
         "adjacency": adjacency,
         "edge_meta": edge_meta,
     }
@@ -3852,7 +3875,7 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
             W_DUR,
             W_SIZE,
             DUR_POWER,
-            SZ_POWER,
+            SIZE_POWER,
         )
 
         candidates_mask = _optimistic_filter(
@@ -3865,7 +3888,7 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
             W_NAME,
             W_DUR,
             W_SIZE,
-            NAME_PWR,
+            NAME_POWER,
             FUZZY_MATCHING_MODE,
             USE_META_FUZZY,
         )
@@ -4098,8 +4121,6 @@ async def _get_potential_duplicate_groups(
 
     if ENABLE_FUZZY_MATCHING:
         return await asyncio.to_thread(_group_audios_fuzzy_optimized, all_audios)
-        # from bench_fuzzy_crossover import bench_fuzzy_crossover
-        # await asyncio.to_thread(bench_fuzzy_crossover, all_audios)
         # return []
     else:
         return await asyncio.to_thread(_group_audios_by_duplicates, all_audios)
@@ -4370,11 +4391,9 @@ async def _send_archive_header(
         chat_id: ID обрабатываемого чата.
         count: Число сообщений в плане удаления.
     """
-    # title = ""
     try:
         chat = await app.get_chat(chat_id)
         remember_chat(chat)
-        # title = (chat.title or getattr(chat, "first_name", "") or "").strip()
     except Exception:
         pass
 
@@ -4672,28 +4691,29 @@ async def main() -> None:
     """Главная управляющая функция."""
     args = parse_arguments()
 
-    # Экспорты
+    # Экспорты: подкоманда -> (функция, финальное сообщение)
+    export_actions: Final[dict[str, tuple[Callable[[ChatID], Any], str]]] = {
+        "filenames": (export_filenames_to_txt, "Задача экспорта имен файлов завершена."),
+        "filenames-url": (
+            export_filenames_with_url_to_txt,
+            "Задача экспорта имен файлов со ссылками завершена.",
+        ),
+        "cleaned-names": (
+            export_cleaned_names_to_csv,
+            "Задача экспорта очищенных имен завершена.",
+        ),
+        "cleaned-meta": (
+            export_cleaned_meta_to_csv,
+            "Задача экспорта очищенных метаданных завершена.",
+        ),
+        "xlsx": (export_database_to_xlsx, "Задача экспорта Excel завершена."),
+    }
+
     if args.command == "export":
-        if args.export_command == "filenames":
-            await export_filenames_to_txt(args.chat)
-            log.info("Задача экспорта имен файлов завершена. Выход.")
-            return
-        elif args.export_command == "filenames-url":
-            await export_filenames_with_url_to_txt(args.chat)
-            log.info("Задача экспорта имен файлов со ссылками завершена. Выход.")
-            return
-        elif args.export_command == "cleaned-names":
-            await export_cleaned_names_to_csv(args.chat)
-            log.info("Задача экспорта очищенных имен завершена. Выход.")
-            return
-        elif args.export_command == "cleaned-meta":
-            await export_cleaned_meta_to_csv(args.chat)
-            log.info("Задача экспорта очищенных метаданных завершена. Выход.")
-            return
-        elif args.export_command == "xlsx":
-            await export_database_to_xlsx(args.chat)
-            log.info("Задача экспорта Excel завершена. Выход.")
-            return
+        export_func, done_message = export_actions[args.export_command]
+        await export_func(args.chat)
+        log.info(f"{done_message} Выход.")
+        return
 
     async with async_ipc_lock(LOCK_FILE, timeout=LOCK_TIMEOUT):
         if not await check_disk_space():
