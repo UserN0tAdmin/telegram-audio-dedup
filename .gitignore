@@ -1,0 +1,26 @@
+# Секреты и персональные данные
+.env
+config.cfg
+*.session
+*.session-journal
+
+# Данные приложения
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.lock
+exports/
+log/
+downloads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Инструменты
+.idea/
+.ruff_cache/
+.mypy_cache/
+.zcode/
