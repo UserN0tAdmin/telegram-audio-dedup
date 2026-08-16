@@ -1,103 +1,101 @@
 import argparse
 import asyncio
+import datetime
+import functools
 import hashlib
+import io
 import itertools
 import lzma
 import os
+import re
 import shutil
+import sqlite3
 import stat as statmod
 import sys
-from argparse import Namespace
-from collections import defaultdict, Counter, deque
-from contextlib import asynccontextmanager, contextmanager
-import datetime
-from pathlib import Path
 import time
-from typing import Any, Callable, AsyncGenerator, Generator, Final, NamedTuple
-from urllib.parse import urlparse
-import re
-import io
+from argparse import Namespace
+from collections import Counter, defaultdict, deque
+from collections.abc import AsyncGenerator, Callable, Generator
+from contextlib import asynccontextmanager, contextmanager
 from itertools import combinations
-import functools
-import sqlite3
+from pathlib import Path
+from typing import Any, Final, NamedTuple
+from urllib.parse import urlparse
 
 import aiosqlite
 import fasteners
 import numpy as np
+from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
+
+# Используется kurigram
+from pyrogram import Client, types
+from pyrogram.connection.transport.tcp import TCPAbridged  # , TCPIntermediatePadded
+from pyrogram.enums import ChatMemberStatus, ChatType, MessagesFilter
+from pyrogram.errors import (
+    PeerIdInvalid,
+    UsernameInvalid,
+    UsernameNotOccupied,
+    UserNotParticipant,
+)
 from rapidfuzz import fuzz, process
 from rapidfuzz.utils import default_process
 
-# Используется kurigram
-from pyrogram import Client
-from pyrogram.errors import (
-    UserNotParticipant,
-    UsernameNotOccupied,
-    PeerIdInvalid,
-    UsernameInvalid,
-)
-from pyrogram.enums import ChatType, ChatMemberStatus, MessagesFilter
-from pyrogram import types
-from pyrogram.connection.transport.tcp import TCPAbridged #, TCPIntermediatePadded
-from tcp_padded import TCPPadded
-
-
-from mtproxy_bridge import is_mtproto_link, start_local_bridge, needs_padded_transport
 from config import (
+    _KEEP_CRITERIA_VALID,
+    ABORT_DELETE_ON_ARCHIVE_FAILURE,
     API_HASH,
     API_ID,
+    ARCHIVE_BEFORE_DELETE,
+    ARCHIVE_HIDE_SENDER,
+    ARCHIVE_MODE,
     ARCHIVE_OLD_BACKUPS,
+    ARCHIVE_TARGET,
     BACKUP_DIR,
     BACKUP_ON_STARTUP,
     BACKUP_ONLY_IF_CHANGED,
     BATCH_DELETE_SIZE,
+    CHAT_LABEL_PARTS,
     CHAT_LIST,
     DB_CACHE_SIZE,
     DB_FILE,
-    SYNC_BATCH_SIZE,
+    DOWNLOADS_DIR,
     DRY_RUN,
     DURATION_POWER,
     DYNAMIC_SPACE_COEFFICIENT,
     DYNAMIC_SPACE_SAFETY_BUFFER_MB,
     ENABLE_FUZZY_MATCHING,
-    FUZZY_THRESHOLD,
+    EXPORTS_DIR,
     FUZZY_MATCHING_MODE,
+    FUZZY_THRESHOLD,
     KEEP_PRIORITY,
     LOCK_TIMEOUT,
     LZMA_PRESET,
     MAX_ARCHIVES,
     MAX_BACKUPS,
     MAX_DURATION_DIFF_SEC,
-    NAME_POWER,
     MIN_FREE_SPACE_MB,
-    PROXY_URL,
+    NAME_POWER,
     PENALTY_NUMBERS_MISMATCH,
+    PROXY_URL,
     RAW_IGNORE_LIST,
-    USE_JACCARD_PENALTY,
-    USE_META_FUZZY,
+    RAW_IGNORE_REGEX,
+    REPORT_ONLY,
     REVOKE_PRIVATE_CHATS,
     ROTATE_BEFORE_BACKUP,
     SESSION_NAME,
     SIZE_POWER,
+    SLEEP_THRESHOLD,
+    SYNC_BATCH_SIZE,
+    USE_JACCARD_PENALTY,
+    USE_META_FUZZY,
     VERIFY_CHUNK_SIZE,
     VERIFY_CONCURRENCY,
     WEIGHT_DURATION,
     WEIGHT_NAME,
     WEIGHT_SIZE,
-    SLEEP_THRESHOLD,
-    DOWNLOADS_DIR,
-    EXPORTS_DIR,
-    REPORT_ONLY,
-    ARCHIVE_BEFORE_DELETE,
-    ARCHIVE_TARGET,
-    ARCHIVE_MODE,
-    ARCHIVE_HIDE_SENDER,
-    ABORT_DELETE_ON_ARCHIVE_FAILURE,
-    RAW_IGNORE_REGEX,
-    _KEEP_CRITERIA_VALID,
-    CHAT_LABEL_PARTS,
 )
 from logger import log
-
+from tcp_padded import TCPPadded
 
 LOCK_FILE = Path(f"{SESSION_NAME}.lock")
 
@@ -114,15 +112,18 @@ type ChatID = int
 type MessageID = int
 type FileUniqueID = str
 
+
 # Структура, которую возвращает _get_audio_attributes
 class AudioMeta(NamedTuple):
     """Атрибуты аудиосообщения (порядок полей = порядок колонок audios в БД)."""
+
     file_unique_id: FileUniqueID
     file_name: str | None
     file_size: int
     duration: int
     performer: str | None
     title: str | None
+
 
 # Структура для одной строки из БД (обертка над sqlite Row)
 type DBRow = aiosqlite.Row
@@ -136,6 +137,7 @@ type CsvRowFormatter = Callable[[DBRow], list[str] | None]
 # Ключ ребра графа дубликатов: упорядоченная пара (min message_id, max message_id)
 type EdgeKey = tuple[MessageID, MessageID]
 
+
 class EdgeInfo(NamedTuple):
     """Причина связи двух файлов и коэффициенты сходства.
 
@@ -148,6 +150,7 @@ class EdgeInfo(NamedTuple):
     penalty — штраф за несовпадение числовых токенов (0.0 если нет).
     text_source — код источника fuzzy-совпадения (0..3); None для uid/meta.
     """
+
     reason: str
     score: float
     name: float | None
@@ -156,21 +159,26 @@ class EdgeInfo(NamedTuple):
     penalty: float
     text_source: int | None = None
 
+
 # message_id-пара -> метаданные связи
 type EdgeMeta = dict[EdgeKey, EdgeInfo]
+
 
 def _edge_key(a: MessageID, b: MessageID) -> EdgeKey:
     """Канонический (неориентированный) ключ ребра."""
     return (a, b) if a < b else (b, a)
 
+
 # Словари для верификации (ID сообщения -> Объект сообщения или Ошибка/None)
 type VerifiedMessagesDict = dict[MessageID, types.Message | None | Exception]
 
+
 # Результат классификации дубликатов
 class ClassificationResult(NamedTuple):
-    delete_from_tg: set[MessageID]      # удалить из Telegram
-    delete_from_db: set[MessageID]      # удалить только из БД (сообщения нет в ТГ)
-    update_in_db: list[types.Message]   # обновить в БД (контент изменился)
+    delete_from_tg: set[MessageID]  # удалить из Telegram
+    delete_from_db: set[MessageID]  # удалить только из БД (сообщения нет в ТГ)
+    update_in_db: list[types.Message]  # обновить в БД (контент изменился)
+
 
 # Алиас для функции форматирования строки при экспорте
 type RowFormatter = Callable[[DBRow], str | None]
@@ -197,9 +205,9 @@ class IgnoreListResolutionError(Exception):
 # region --- СИСТЕМНЫЕ УТИЛИТЫ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 # Блок для общих, низкоуровневых задач, не связанных напрямую с бизнес-логикой: парсинг аргументов, блокировка, форматирование и работа с файловой системой.
 
+
 def parse_arguments() -> argparse.Namespace:
-    """
-    Настраивает и парсит аргументы командной строки.
+    """Настраивает и парсит аргументы командной строки.
 
     Подкоманды: ``repair``, ``report``, ``download``, ``export``.
     Вызов без подкоманды — обычный прогон дедупликации.
@@ -303,11 +311,8 @@ def parse_arguments() -> argparse.Namespace:
 
 
 @asynccontextmanager
-async def async_ipc_lock(
-    path: str | Path, timeout: float | None = 0
-) -> AsyncGenerator[None, None]:
-    """
-    Асинхронный контекстный менеджер для межпроцессной блокировки.
+async def async_ipc_lock(path: str | Path, timeout: float | None = 0) -> AsyncGenerator[None, None]:
+    """Асинхронный контекстный менеджер для межпроцессной блокировки.
     Предотвращает одновременный запуск нескольких копий скрипта.
 
     path — путь к lock-файлу (например, my_script.lock)
@@ -333,8 +338,7 @@ async def async_ipc_lock(
 
 @contextmanager
 def secure_umask(mask: int = 0o077) -> Generator[None, None, None]:
-    """
-    Контекстный менеджер для временной и безопасной установки umask процесса.
+    """Контекстный менеджер для временной и безопасной установки umask процесса.
     Гарантирует восстановление исходной маски после выхода из блока.
     """
     original_umask = os.umask(mask)
@@ -349,9 +353,9 @@ def secure_umask(mask: int = 0o077) -> Generator[None, None, None]:
 def _format_bytes(size_bytes: int | float) -> str:
     """Форматирует байты в человекочитаемый вид (B, KiB, MiB, GiB, TiB)."""
     size_bytes = abs(size_bytes)
-    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+    for unit in ("B", "KiB", "MiB", "GiB"):
         if size_bytes < 1024.0:
-            return f"{int(size_bytes)} {unit}" if unit == 'B' else f"{size_bytes:.2f} {unit}"
+            return f"{int(size_bytes)} {unit}" if unit == "B" else f"{size_bytes:.2f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.2f} TiB"
 
@@ -372,15 +376,13 @@ def _format_duration(seconds: int | None) -> str:
 
 
 def _sanitize_filename(filename: str) -> str:
-    """
-    Очищает имя файла от запрещенных системных символов,
+    """Очищает имя файла от запрещенных системных символов,
     сохраняя читаемость, пробелы и unicode (кириллицу, эмодзи).
     """
-
     MAX_FILENAME_BYTES = 215
-    _RESERVED_NAMES = frozenset({"CON", "PRN", "AUX", "NUL"} | {
-        f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)
-    })
+    _RESERVED_NAMES = frozenset(
+        {"CON", "PRN", "AUX", "NUL"} | {f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)}
+    )
 
     if not filename:
         return "unnamed_file"
@@ -400,13 +402,13 @@ def _sanitize_filename(filename: str) -> str:
     if len(cleaned.encode("utf-8")) > MAX_FILENAME_BYTES:
         stem, dot, ext = cleaned.rpartition(".")
         if dot and len(ext.encode("utf-8")) <= 20:
-            ext_bytes = f".{ext}".encode("utf-8")
-            stem = stem.encode("utf-8")[:MAX_FILENAME_BYTES - len(ext_bytes)] \
-                       .decode("utf-8", errors="ignore")
+            ext_bytes = f".{ext}".encode()
+            stem = stem.encode("utf-8")[: MAX_FILENAME_BYTES - len(ext_bytes)].decode(
+                "utf-8", errors="ignore"
+            )
             cleaned = f"{stem}.{ext}"
         else:
-            cleaned = cleaned.encode("utf-8")[:MAX_FILENAME_BYTES] \
-                             .decode("utf-8", errors="ignore")
+            cleaned = cleaned.encode("utf-8")[:MAX_FILENAME_BYTES].decode("utf-8", errors="ignore")
 
     return cleaned or "unnamed_file"
 
@@ -414,7 +416,7 @@ def _sanitize_filename(filename: str) -> str:
 def _calculate_file_hash_sync(file_path: Path) -> str:
     """(СИНХРОННАЯ!) Вычисляет хэш-сумму BLAKE2b файла"""
     with open(file_path, "rb") as f:
-        return hashlib.file_digest(f, 'blake2b').hexdigest()
+        return hashlib.file_digest(f, "blake2b").hexdigest()
 
 
 def _get_existing_parent(path: Path) -> Path:
@@ -442,21 +444,19 @@ def _get_size_safely(path: Path) -> int:
 
 def remember_chat(chat: types.Chat) -> None:
     """Запоминает отображаемое имя чата."""
-    name = (
-        chat.title
-        or " ".join(
-            p for p in (
-                getattr(chat, "first_name", ""),
-                getattr(chat, "last_name", ""),
-            )
-            if p
+    name = chat.title or " ".join(
+        p
+        for p in (
+            getattr(chat, "first_name", ""),
+            getattr(chat, "last_name", ""),
         )
+        if p
     )
     name = " ".join((name or "").split())
     CHAT_LABELS[chat.id] = (name, chat.username)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _username_from_session(chat_id: int) -> str | None:
     """Юзернейм из файла сессии (только чтение). None — не нашли/не смогли."""
     try:
@@ -469,7 +469,7 @@ def _username_from_session(chat_id: int) -> str | None:
         return None
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _id_from_session(identifier: str) -> int | None:
     """Обратный резолв: @username / t.me-ссылка -> id из файла сессии."""
     raw = identifier.strip()
@@ -522,11 +522,7 @@ def chat_label(chat_id: int) -> str:
         "id": str(chat_id),
     }
 
-    parts = [
-        values[key]
-        for key in CHAT_LABEL_PARTS
-        if key in values and values[key]
-    ]
+    parts = [values[key] for key in CHAT_LABEL_PARTS if values.get(key)]
 
     if not parts:
         return str(chat_id)
@@ -609,17 +605,13 @@ async def _check_dynamic_disk_space() -> bool:
         db_size, backups_size = await asyncio.to_thread(_scan_project_files_sync)
 
         if db_size == 0 and not Path(BACKUP_DIR).exists():
-            log.info(
-                "Проект еще не содержит данных. Проверка свободного места не требуется."
-            )
+            log.info("Проект еще не содержит данных. Проверка свободного места не требуется.")
             return True
 
         safety_buffer_bytes = DYNAMIC_SPACE_SAFETY_BUFFER_MB * 1024 * 1024
 
         if BACKUP_ON_STARTUP:
-            required_bytes = int(
-                db_size * DYNAMIC_SPACE_COEFFICIENT + safety_buffer_bytes
-            )
+            required_bytes = int(db_size * DYNAMIC_SPACE_COEFFICIENT + safety_buffer_bytes)
             log_reason = "Для создания бэкапа и роста БД"
         else:
             # Используем 20% от "запаса прочности" (coeff-1.0) для оценки роста.
@@ -632,14 +624,10 @@ async def _check_dynamic_disk_space() -> bool:
         target_path = _get_existing_parent(backup_path)
         _, _, free_bytes = await asyncio.to_thread(shutil.disk_usage, target_path)
 
-        log.info(
-            f"Текущий размер файлов проекта: {_format_bytes(db_size + backups_size)}."
-        )
+        log.info(f"Текущий размер файлов проекта: {_format_bytes(db_size + backups_size)}.")
         log.info(f"  - Размер БД (с .wal/.shm): {_format_bytes(db_size)}.")
         log.info(f"  - Размер существующих бэкапов: {_format_bytes(backups_size)}.")
-        log.info(
-            f"{log_reason} требуется ~{_format_bytes(required_bytes)} свободного места."
-        )
+        log.info(f"{log_reason} требуется ~{_format_bytes(required_bytes)} свободного места.")
         log.info(f"Доступно на разделе '{target_path}': {_format_bytes(free_bytes)}.")
 
         if free_bytes < required_bytes:
@@ -656,9 +644,7 @@ async def _check_dynamic_disk_space() -> bool:
 
 
 def _scan_project_files_sync() -> tuple[int, int]:
-    """
-    (СИНХРОННАЯ!) Безопасно сканирует файлы проекта, возвращая их размеры.
-    """
+    """(СИНХРОННАЯ!) Безопасно сканирует файлы проекта, возвращая их размеры."""
     db_path = Path(DB_FILE)
 
     db_main_size = _get_size_safely(db_path)
@@ -699,22 +685,14 @@ async def create_database_backup() -> None:
         hash_file_path = backup_dir / ".latest_backup.hash"
 
         try:
-            log.info(
-                "Вычисляю хэш-сумму текущей БД (это может занять время для больших файлов)..."
-            )
-            current_db_hash = await asyncio.to_thread(
-                _calculate_file_hash_sync, source_db_path
-            )
+            log.info("Вычисляю хэш-сумму текущей БД (это может занять время для больших файлов)...")
+            current_db_hash = await asyncio.to_thread(_calculate_file_hash_sync, source_db_path)
             log.debug(f"Текущий хэш БД: {current_db_hash[:40]}...")
 
             if not hash_file_path.is_file():
-                log.info(
-                    "Файл с хэшем предыдущего бэкапа не найден. Будет создан новый."
-                )
+                log.info("Файл с хэшем предыдущего бэкапа не найден. Будет создан новый.")
             else:
-                stored_hash = await asyncio.to_thread(
-                    hash_file_path.read_text, encoding="utf-8"
-                )
+                stored_hash = await asyncio.to_thread(hash_file_path.read_text, encoding="utf-8")
                 log.debug(f"Хэш бэкапа БД: {stored_hash[:40]}...")
                 if current_db_hash == stored_hash.strip():
                     log.info(
@@ -730,14 +708,10 @@ async def create_database_backup() -> None:
                 f"Не удалось проверить хэш-сумму БД. Ошибка: {e}. Бэкап будет создан для безопасности."
             )
             if not current_db_hash:
-                current_db_hash = await asyncio.to_thread(
-                    _calculate_file_hash_sync, source_db_path
-                )
+                current_db_hash = await asyncio.to_thread(_calculate_file_hash_sync, source_db_path)
 
     if not current_db_hash:
-        current_db_hash = await asyncio.to_thread(
-            _calculate_file_hash_sync, source_db_path
-        )
+        current_db_hash = await asyncio.to_thread(_calculate_file_hash_sync, source_db_path)
 
     await asyncio.to_thread(os.makedirs, backup_dir, exist_ok=True)
 
@@ -748,9 +722,7 @@ async def create_database_backup() -> None:
 
     # --- БЛОК 3: Создание бэкапа (Единая точка входа) ---
     # Мы вызываем создание здесь один раз, независимо от режима ротации
-    new_backup_path = await _perform_backup_creation(
-        source_db_path, backup_dir, current_db_hash
-    )
+    new_backup_path = await _perform_backup_creation(source_db_path, backup_dir, current_db_hash)
 
     # --- БЛОК 4: Обработка результата и Ротация "ПОСЛЕ" ---
     if new_backup_path:
@@ -764,9 +736,7 @@ async def create_database_backup() -> None:
 
         # 4.2. Ротация "ПОСЛЕ", если она не была выполнена "ДО"
         if not ROTATE_BEFORE_BACKUP:
-            log.info(
-                "Обычный режим: выполнение ротации после успешного создания бэкапа."
-            )
+            log.info("Обычный режим: выполнение ротации после успешного создания бэкапа.")
             await _perform_rotation(source_db_path, backup_dir)
     else:
         # Если создание не удалось
@@ -779,8 +749,7 @@ async def create_database_backup() -> None:
 async def _perform_backup_creation(
     source_db_path: Path, backup_dir: Path, db_hash: str
 ) -> Path | None:
-    """
-    Атомарно создает одну новую резервную копию.
+    """Атомарно создает одну новую резервную копию.
     Возвращает путь к ней или None в случае ошибки.
     """
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -848,9 +817,7 @@ async def _perform_rotation(source_db_path: Path, backup_dir: Path) -> None:
             else:
                 # Если ротация ДО создания, мы должны оставить место под 1 новый (MAX - 1).
                 # Если ПОСЛЕ, то мы уже создали, значит храним ровно MAX.
-                target_hot_backups = (
-                    MAX_BACKUPS - 1 if ROTATE_BEFORE_BACKUP else MAX_BACKUPS
-                )
+                target_hot_backups = MAX_BACKUPS - 1 if ROTATE_BEFORE_BACKUP else MAX_BACKUPS
 
             # Защита от отрицательных чисел (на всякий случай)
             if target_hot_backups < 0:
@@ -924,6 +891,7 @@ def _compress_file_sync(source_path: Path, dest_path: Path, preset: int) -> None
 # region --- ОПЕРАЦИИ С БАЗОЙ ДАННЫХ ---
 # Этот блок отвечает за все прямое взаимодействие с файлом SQLite: инициализация, подключение, валидация, ремонт и простые запросы (получение ID).
 
+
 # todo Добавить версирование БД user_version
 async def initialize_database() -> None:
     """Выполняется ОДИН РАЗ при запуске. Создает новую схему БД."""
@@ -992,8 +960,7 @@ async def create_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
 
 
 async def validate_database() -> bool:
-    """
-    Проверяет целостность БД.
+    """Проверяет целостность БД.
     Возвращает False (блокирует запуск), если:
     1. Файл БД физически поврежден.
     2. Отсутствуют обязательные таблицы.
@@ -1014,9 +981,7 @@ async def validate_database() -> bool:
                     return False
 
             # --- 2. Наличие таблиц (CRITICAL) ---
-            async with conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-            ) as cur:
+            async with conn.execute("SELECT name FROM sqlite_master WHERE type='table'") as cur:
                 tables = {row[0] for row in await cur.fetchall()}
 
             required = {"audios", "chat_sync_state"}
@@ -1045,9 +1010,7 @@ async def validate_database() -> bool:
                     return False
 
             # --- 4. Наличие индексов (WARNING) ---
-            async with conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index'"
-            ) as cur:
+            async with conn.execute("SELECT name FROM sqlite_master WHERE type='index'") as cur:
                 indexes = {row[0] for row in await cur.fetchall()}
 
             for idx in ("idx_chat_unique", "idx_chat_meta"):
@@ -1063,7 +1026,9 @@ async def validate_database() -> bool:
 
                 if bad_cursors > 0:
                     warnings += 1
-                    log.warning(f"Найдено {bad_cursors} некорректных курсоров истории (рекомендуется команда repair).")
+                    log.warning(
+                        f"Найдено {bad_cursors} некорректных курсоров истории (рекомендуется команда repair)."
+                    )
 
     except aiosqlite.Error as e:
         log.critical(f"Ошибка SQLite при валидации: {e}")
@@ -1081,8 +1046,7 @@ async def validate_database() -> bool:
 
 
 async def repair_database(app: Client) -> None:
-    """
-    Выполняет умное восстановление и очистку базы данных.
+    """Выполняет умное восстановление и очистку базы данных.
     Пытается восстановить поврежденные записи, используя данные из Telegram.
     """
     log.info("=" * 15 + "ЗАПУСК РЕМОНТА БД" + "=" * 15)
@@ -1153,9 +1117,7 @@ async def repair_database(app: Client) -> None:
                     "UPDATE audios SET file_unique_id=?, file_name=?, file_size=?, duration=?, performer=?, title=? WHERE chat_id=? AND message_id=?",
                     records_to_update,
                 )
-                log.info(
-                    f"  Восстановлено (обновлено) {len(records_to_update)} записей."
-                )
+                log.info(f"  Восстановлено (обновлено) {len(records_to_update)} записей.")
 
             if ids_to_delete:
                 await conn.executemany(
@@ -1169,9 +1131,7 @@ async def repair_database(app: Client) -> None:
             "UPDATE chat_sync_state SET newest_scanned_id = 0 WHERE newest_scanned_id < 0"
         ) as cursor:
             if cursor.rowcount > 0:
-                log.info(
-                    f"  Сброшено {cursor.rowcount} некорректных newest_scanned_id."
-                )
+                log.info(f"  Сброшено {cursor.rowcount} некорректных newest_scanned_id.")
 
         log.info("  Проверка и создание индексов...")
         await conn.execute(
@@ -1189,10 +1149,7 @@ async def repair_database(app: Client) -> None:
     # --- ЧАСТЬ 2: Оптимизация (VACUUM) на новом соединении ---
     log.info("\nЭтап 3: Оптимизация файла БД (VACUUM)...")
     try:
-        async with aiosqlite.connect(
-            DB_FILE, isolation_level=None
-        ) as conn:
-
+        async with aiosqlite.connect(DB_FILE, isolation_level=None) as conn:
             log.info("  -> Выполнение wal_checkpoint(TRUNCATE)...")
             async with conn.execute("PRAGMA wal_checkpoint(TRUNCATE);") as cursor:
                 await cursor.fetchall()
@@ -1213,6 +1170,7 @@ async def repair_database(app: Client) -> None:
 
 # region --- Под-блок: Экспорты ---
 # todo Поиск по всем чатам в БД с пониманием опечаток(--search)
+
 
 # todo ротация?
 def _build_export_path(
@@ -1245,17 +1203,14 @@ def _build_export_path(
 async def _generic_export_to_txt(
     chat_id: ChatID, output_file: str, sql_query: str, line_formatter: RowFormatter
 ) -> None:
-    """
-    Общая (generic) функция для экспорта данных из БД в текстовый файл.
+    """Общая (generic) функция для экспорта данных из БД в текстовый файл.
     Принимает SQL-запрос и функцию-форматтер для строк.
     """
     log.info(f"Запущена задача экспорта для чата {chat_label(chat_id)} в файл '{output_file}'...")
 
     try:
         if not Path(DB_FILE).exists():
-            log.critical(
-                f"Файл базы данных '{DB_FILE}' не найден. Нечего экспортировать."
-            )
+            log.critical(f"Файл базы данных '{DB_FILE}' не найден. Нечего экспортировать.")
             return
 
         async with aiosqlite.connect(DB_FILE) as conn:
@@ -1283,9 +1238,7 @@ async def _generic_export_to_txt(
     except aiosqlite.Error as e:
         log.critical(f"Произошла ошибка SQLite при экспорте: {e}")
     except Exception as e:
-        log.critical(
-            f"Произошла непредвиденная ошибка при экспорте: {e}", exc_info=True
-        )
+        log.critical(f"Произошла непредвиденная ошибка при экспорте: {e}", exc_info=True)
 
 
 async def _generic_export_to_csv(
@@ -1308,7 +1261,9 @@ async def _generic_export_to_csv(
     if is_full_export:
         log.info(f"Запущена задача ПОЛНОГО экспорта '{kind}' в '{output_file}'...")
     else:
-        log.info(f"Запущена задача экспорта '{kind}' для чата {chat_label(chat_id)} в '{output_file}'...")
+        log.info(
+            f"Запущена задача экспорта '{kind}' для чата {chat_label(chat_id)} в '{output_file}'..."
+        )
 
     try:
         if not Path(DB_FILE).exists():
@@ -1333,6 +1288,7 @@ async def _generic_export_to_csv(
 
         def write_to_file_sync():
             import csv
+
             # utf-8-sig нужен, чтобы Excel автоматически правильно распознал кириллицу
             with open(output_file, "w", encoding="utf-8-sig", newline="") as f:
                 # delimiter=';' используется по умолчанию в русскоязычном Excel
@@ -1353,9 +1309,7 @@ async def _generic_export_to_csv(
 
 
 async def export_filenames_to_txt(chat_id: ChatID) -> None:
-    """
-    Экспортирует ТОЛЬКО имена файлов. (Функция-обертка)
-    """
+    """Экспортирует ТОЛЬКО имена файлов. (Функция-обертка)"""
     output_file = _build_export_path(chat_id, "filenames", "txt")
 
     await _generic_export_to_txt(
@@ -1367,20 +1321,16 @@ async def export_filenames_to_txt(chat_id: ChatID) -> None:
 
 
 async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
-    """
-    Экспортирует имена файлов и ССЫЛКИ. (Функция-обертка)
-    """
-
+    """Экспортирует имена файлов и ССЫЛКИ. (Функция-обертка)"""
     try:
         from wcwidth import wcswidth
     except ImportError:
-        log.warning(
-            "Библиотека 'wcwidth' не найдена. Выравнивание колонок может быть неточным."
-        )
+        log.warning("Библиотека 'wcwidth' не найдена. Выравнивание колонок может быть неточным.")
         wcswidth = len
 
     # if "-100" not in str(chat_id): log.warning("Возможно личный чат, ссылки могут быть не действительны!")
-    if chat_id >= 0: log.warning("Возможно личный чат, ссылки могут быть не действительны!")
+    if chat_id >= 0:
+        log.warning("Возможно личный чат, ссылки могут быть не действительны!")
     public_chat_id = str(chat_id).removeprefix("-100")
 
     def formatter(row: aiosqlite.Row) -> str | None:
@@ -1393,9 +1343,7 @@ async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
         # 1. Вычисляем реальную визуальную ширину имени файла
         visual_width = wcswidth(file_name)
         if visual_width < 0:
-            visual_width = len(
-                file_name
-            )
+            visual_width = len(file_name)
 
         # 2. Вычисляем, сколько пробелов нужно добавить
         padding_needed = target_width - visual_width
@@ -1420,11 +1368,11 @@ async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
 
 
 async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
-    """
-    Экспортирует процесс очистки имен файлов в CSV для проверки работы фильтров.
+    """Экспортирует процесс очистки имен файлов в CSV для проверки работы фильтров.
     Формат: Исходное имя, После _clean_filename, После default_process
     Если chat_id == 0, экспортируется вся база целиком.
     """
+
     def formatter(row: DBRow) -> list[str] | None:
         orig = row["file_name"]
         if not orig:
@@ -1443,12 +1391,12 @@ async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
 
 
 async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
-    """
-    Экспортирует процесс очистки метаданных (performer+title) в CSV.
+    """Экспортирует процесс очистки метаданных (performer+title) в CSV.
     Формат: Performer, Title, После _clean_meta, После default_process
     Показывает ровно ту строку, которую видит fuzzy-матчер.
     Если chat_id == 0, экспортируется вся база целиком.
     """
+
     def formatter(row: DBRow) -> list[str] | None:
         cleaned = _clean_meta(row["performer"], row["title"])
         if not cleaned:
@@ -1473,9 +1421,7 @@ async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
 
 
 async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
-    """
-    Скачивает все аудиофайлы из указанного чата в локальную папку downloads.
-    """
+    """Скачивает все аудиофайлы из указанного чата в локальную папку downloads."""
     log.info(f"Запуск режима СКАЧИВАНИЯ для чата {chat_label(chat_id)}...")
 
     download_dir = Path(DOWNLOADS_DIR) / str(chat_id)
@@ -1484,12 +1430,14 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
     IS_TTY = sys.stdout.isatty()
 
-    async with create_connection() as conn:
-        async with conn.execute(
+    async with (
+        create_connection() as conn,
+        conn.execute(
             "SELECT message_id, file_name, file_size FROM audios WHERE chat_id = ? ORDER BY message_id",
             (chat_id,),
-        ) as cursor:
-            records = await cursor.fetchall()
+        ) as cursor,
+    ):
+        records = await cursor.fetchall()
 
     if not records:
         log.warning(
@@ -1519,7 +1467,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
             log.info("Загрузка отменена.")
             raise
 
-    log.info(f"Инициализация очереди загрузки...")
+    log.info("Инициализация очереди загрузки...")
 
     # Ограничение одновременных загрузок
     # todo (Проверить на премиуме)
@@ -1568,6 +1516,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
                 last_update_time = now
 
         return progress
+
     async def worker():
         while True:
             try:
@@ -1592,9 +1541,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
                         mime = message.audio.mime_type
                     elif message.document:
                         mime = message.document.mime_type
-                    guessed_ext = (
-                        app.guess_extension(mime) if mime else None
-                    )
+                    guessed_ext = app.guess_extension(mime) if mime else None
                     safe_name += guessed_ext if guessed_ext else ".mp3"
 
                 final_path = download_dir / safe_name
@@ -1616,7 +1563,9 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
                     size_matches = existing_size > 0 and abs(existing_size - expected_size) < 100
                     # 2 сек погрешности для файловых систем типа FAT32/exFAT
-                    mtime_matches = expected_mtime == 0 or abs(existing_mtime - expected_mtime) <= 2.0
+                    mtime_matches = (
+                        expected_mtime == 0 or abs(existing_mtime - expected_mtime) <= 2.0
+                    )
 
                     if size_matches and mtime_matches:
                         should_download = False
@@ -1632,9 +1581,12 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
                                 existing_mtime_renamed = 0
 
                             if (
-                                    existing_size_renamed > 0
-                                    and abs(existing_size_renamed - expected_size) < 100
-                                    and (expected_mtime == 0 or abs(existing_mtime_renamed - expected_mtime) <= 2.0)
+                                existing_size_renamed > 0
+                                and abs(existing_size_renamed - expected_size) < 100
+                                and (
+                                    expected_mtime == 0
+                                    or abs(existing_mtime_renamed - expected_mtime) <= 2.0
+                                )
                             ):
                                 should_download = False
 
@@ -1647,9 +1599,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
                     active_downloads[safe_name] = 0
                     # --- Скачивание ---
                     if not IS_TTY:
-                        log.info(
-                            f"Начало загрузки: {safe_name} ({_format_bytes(expected_size)})"
-                        )
+                        log.info(f"Начало загрузки: {safe_name} ({_format_bytes(expected_size)})")
                     else:
                         display_status()
 
@@ -1686,8 +1636,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
                 stats["error"] += 1
 
             finally:
-                if safe_name in active_downloads:
-                    del active_downloads[safe_name]
+                active_downloads.pop(safe_name, None)
                 display_status()
                 queue.task_done()
 
@@ -1734,9 +1683,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
             processed_count += len(chunk_ids)
             if processed_count % 500 == 0:
                 _clear_line()
-                log.info(
-                    f"--- Обработано метаданных {processed_count}/{total_files} ---"
-                )
+                log.info(f"--- Обработано метаданных {processed_count}/{total_files} ---")
                 display_status()
 
         await queue.join()
@@ -1756,12 +1703,10 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
 
 async def export_database_to_xlsx(chat_id: ChatID) -> None:
-    """
-    Универсальный экспорт БД в Excel.
+    """Универсальный экспорт БД в Excel.
     Если chat_id == 0, экспортируется вся база целиком.
     Иначе — данные фильтруются по конкретному чату.
     """
-
     try:
         import openpyxl
         from openpyxl.utils.cell import get_column_letter
@@ -1818,7 +1763,7 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
             return ""
         if isinstance(value, bytes):
             return f"<BLOB {len(value)} bytes>"
-        if isinstance(value, str) and value.startswith(('=', '+', '-', '@')):
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
             return f"'{value}"
         return value
 
@@ -1868,9 +1813,7 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
 
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
-            async with conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table';"
-            ) as cursor:
+            async with conn.execute("SELECT name FROM sqlite_master WHERE type='table';") as cursor:
                 tables = await cursor.fetchall()
                 table_names = [row[0] for row in tables]
 
@@ -1882,9 +1825,7 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
 
                 try:
                     safe_table_name = table.replace('"', '""')
-                    async with conn.execute(
-                        f'PRAGMA table_info("{safe_table_name}");'
-                    ) as cursor:
+                    async with conn.execute(f'PRAGMA table_info("{safe_table_name}");') as cursor:
                         columns_info = await cursor.fetchall()
                         column_names = [col[1] for col in columns_info]
                 except Exception as e:
@@ -1909,15 +1850,11 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
                             if is_full_export:
                                 log.info(f"  -> Таблица '{table}': пуста.")
                             else:
-                                log.debug(
-                                    f"  -> Таблица '{table}': нет данных для этого чата."
-                                )
+                                log.debug(f"  -> Таблица '{table}': нет данных для этого чата.")
                             continue
 
                         data_found = True
-                        log.info(
-                            f"  -> Таблица '{table}': экспорт {len(rows_tuples)} строк..."
-                        )
+                        log.info(f"  -> Таблица '{table}': экспорт {len(rows_tuples)} строк...")
 
                         await asyncio.to_thread(
                             _append_table_to_workbook,
@@ -1951,9 +1888,7 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
 async def create_duplicates_report(
     chat_id: ChatID, conn: aiosqlite.Connection, ts: str | None = None
 ) -> None:
-    """
-    Создает человекочитаемый отчет о дубликатах с ссылками.
-    """
+    """Создает человекочитаемый отчет о дубликатах с ссылками."""
     log.info(f"Генерация отчета по дубликатам для чата {chat_label(chat_id)}...")
 
     groups, edge_meta = await _get_potential_duplicate_groups(chat_id, conn)
@@ -1983,9 +1918,7 @@ async def create_duplicates_report(
     buf = io.StringIO()
 
     buf.write(f"ОТЧЕТ О ДУБЛИКАТАХ (Чат: {chat_label(chat_id)})\n")
-    buf.write(
-        f"Дата генерации: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    )
+    buf.write(f"Дата генерации: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     buf.write(f"Найдено групп: {len(groups)}\n\n")
     pretty_priority = ", ".join(f"{n} ~{t:.0%}" if t else n for n, t in KEEP_PRIORITY)
     buf.write(f"Стратегия оригинала: {pretty_priority}\n")
@@ -2002,13 +1935,13 @@ async def create_duplicates_report(
         buf.write(
             f"  • Веса:           Имя={WEIGHT_NAME} | Время={WEIGHT_DURATION} | Размер={WEIGHT_SIZE}\n"
         )
-        buf.write(f"  • Степени (p):    Имя={NAME_POWER} | Время={DURATION_POWER} | Размер={SIZE_POWER}\n")
+        buf.write(
+            f"  • Степени (p):    Имя={NAME_POWER} | Время={DURATION_POWER} | Размер={SIZE_POWER}\n"
+        )
         buf.write(f"  • Штраф (числа):  {PENALTY_NUMBERS_MISMATCH}\n")
         buf.write(f"  • Мера Жаккара:   {'ВКЛ' if USE_JACCARD_PENALTY else 'ВЫКЛ'}\n")
         buf.write(f"  • Meta fuzzy:     {'ВКЛ' if USE_META_FUZZY else 'ВЫКЛ'}\n")
-        buf.write(
-            "  • Связи:          score=итог | текст/длит/размер=вклад(0..1) | штраф\n"
-        )
+        buf.write("  • Связи:          score=итог | текст/длит/размер=вклад(0..1) | штраф\n")
     else:
         buf.write("\n[НАСТРОЙКИ ПОИСКА]\n")
         buf.write("  • Режим:          STRICT (Точное совпадение)\n")
@@ -2035,9 +1968,7 @@ async def create_duplicates_report(
             marker = "[KEEP] " if pos == 0 else ""
             buf.write(f"• {marker}{file_name}\n")
             buf.write(f"  Track: {track_meta}\n")
-            buf.write(
-                f"  Info: {size_mb} | Время: {dur_str} | ID: {msg_id} | UID: {msg_uid}\n"
-            )
+            buf.write(f"  Info: {size_mb} | Время: {dur_str} | ID: {msg_id} | UID: {msg_uid}\n")
             buf.write(f"  Link: {link}\n")
             buf.write("\n")
 
@@ -2081,8 +2012,7 @@ async def create_duplicates_report(
 
 
 async def create_telegram_client() -> Client | None:
-    """
-    Создает, настраивает и возвращает экземпляр клиента Kurigram.
+    """Создает, настраивает и возвращает экземпляр клиента Kurigram.
     В случае критической ошибки конфигурации (например, кривой прокси) возвращает None.
     """
     client_kwargs: dict[str, Any] = {
@@ -2091,14 +2021,16 @@ async def create_telegram_client() -> Client | None:
         "no_updates": True,
         "max_concurrent_transmissions": 10,
         "sleep_threshold": SLEEP_THRESHOLD,
-        #"protocol_factory": TCPPadded, # todo в конфиг вынести
+        # "protocol_factory": TCPPadded, # todo в конфиг вынести
     }
 
     if PROXY_URL:
         if is_mtproto_link(PROXY_URL):
             try:
                 local_port = await start_local_bridge(PROXY_URL)
-                transport = TCPPadded if needs_padded_transport(PROXY_URL) else TCPAbridged # todo TCPIntermediatePadded
+                transport = (
+                    TCPPadded if needs_padded_transport(PROXY_URL) else TCPAbridged
+                )  # todo TCPIntermediatePadded
                 client_kwargs["proxy"] = {
                     "scheme": "socks5",
                     "hostname": "127.0.0.1",
@@ -2111,9 +2043,7 @@ async def create_telegram_client() -> Client | None:
                     f"127.0.0.1:{local_port} -> {PROXY_URL.split('server=')[-1].split('&')[0]}"
                 )
             except Exception as e:
-                log.critical(
-                    f"Не удалось поднять локальный мост для MTProto-прокси. Ошибка: {e}"
-                )
+                log.critical(f"Не удалось поднять локальный мост для MTProto-прокси. Ошибка: {e}")
                 return None
         else:
             try:
@@ -2144,8 +2074,7 @@ async def resolve_chat_identifiers(
     identifiers: list[str],
     banner: str | None = "Преобразую идентификаторы чатов в числовые ID...",
 ) -> list[ChatID]:
-    """
-    Преобразует список идентификаторов чатов (числовые ID и @usernames)
+    """Преобразует список идентификаторов чатов (числовые ID и @usernames)
     в список уникальных числовых ID с сохранением исходного порядка.
     Использует контролируемые конкурентные запросы к API.
     """
@@ -2185,7 +2114,9 @@ async def resolve_chat_identifiers(
                 log.error(f"Имя пользователя '{ident}' невалидно. Оно будет пропущено...")
                 return None
             except Exception as e:
-                log.error(f"Произошла непредвиденная ошибка при обработке '{ident}': {e}. Он будет пропущен...")
+                log.error(
+                    f"Произошла непредвиденная ошибка при обработке '{ident}': {e}. Он будет пропущен..."
+                )
                 return None
         if not chat.id:
             log.error(f"Для имени пользователя '{ident}' не получен id. Будет пропущен...")
@@ -2253,17 +2184,23 @@ async def resolve_and_validate_archive_target(app: Client, me_id: int) -> ChatID
             return None
         privs = getattr(member, "privileges", None)
         can_post = bool(privs and privs.can_post_messages)
-        if member.status not in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR) or not can_post:
+        if (
+            member.status not in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+            or not can_post
+        ):
             log.error(f"Нет прав на публикацию в канал {target_id}.")
             return None
 
-    log.info(f"Архивная цель валидна: {target_id} (режим: {ARCHIVE_MODE}, hide_sender={ARCHIVE_HIDE_SENDER}).")
+    log.info(
+        f"Архивная цель валидна: {target_id} (режим: {ARCHIVE_MODE}, hide_sender={ARCHIVE_HIDE_SENDER})."
+    )
     return target_id
 
 
 async def populate_ignore_list(app: Client) -> None:
     """Обрабатывает RAW_IGNORE_LIST и RAW_IGNORE_REGEX: разрешает юзернеймы в ID
-    и заполняет IGNORE_MESSAGES / IGNORE_REGEX / GLOBAL_IGNORE_REGEX."""
+    и заполняет IGNORE_MESSAGES / IGNORE_REGEX / GLOBAL_IGNORE_REGEX.
+    """
     if not RAW_IGNORE_LIST and not RAW_IGNORE_REGEX:
         return
 
@@ -2282,7 +2219,7 @@ async def populate_ignore_list(app: Client) -> None:
         _dispatch(key, lambda cid, ids=msg_ids: IGNORE_MESSAGES[cid].update(ids))
 
     for key, patterns in RAW_IGNORE_REGEX.items():
-        if key == '*':
+        if key == "*":
             GLOBAL_IGNORE_REGEX.extend(patterns)
             continue
         _dispatch(key, lambda cid, pats=patterns: IGNORE_REGEX[cid].extend(pats))
@@ -2303,10 +2240,13 @@ async def populate_ignore_list(app: Client) -> None:
     tasks = [resolve_task(k) for k, _ in usernames_to_resolve]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    errors = [(name, r) for (name, _), r in zip(usernames_to_resolve, results)
-              if isinstance(r, Exception)]
+    errors = [
+        (name, r) for (name, _), r in zip(usernames_to_resolve, results) if isinstance(r, Exception)
+    ]
     if errors:
-        log.critical("ОШИБКА КОНФИГУРАЦИИ: Не удалось проверить идентификаторы в списках исключений:")
+        log.critical(
+            "ОШИБКА КОНФИГУРАЦИИ: Не удалось проверить идентификаторы в списках исключений:"
+        )
         for username, exc in errors:
             log.critical(f" ID/Name '{username}' выдало: {exc}")
         raise IgnoreListResolutionError(f"Ошибок проверки имен: {len(errors)}")
@@ -2353,9 +2293,8 @@ async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Names
             return True
 
         # 5. Боевой режим — нужны права на удаление
-        has_delete_rights = (
-                member.status == ChatMemberStatus.OWNER
-                or (member.privileges and member.privileges.can_delete_messages)
+        has_delete_rights = member.status == ChatMemberStatus.OWNER or (
+            member.privileges and member.privileges.can_delete_messages
         )
 
         if has_delete_rights:
@@ -2371,8 +2310,7 @@ async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Names
 
 
 def _get_audio_attributes(message: types.Message | None) -> AudioMeta | None:
-    """
-    Проверяет, является ли сообщение аудио или аудио-документом.
+    """Проверяет, является ли сообщение аудио или аудио-документом.
     Возвращает AudioMeta с атрибутами
     (file_unique_id, file_name, file_size, duration, performer, title)
     или None, если это не аудиофайл.
@@ -2390,11 +2328,11 @@ def _get_audio_attributes(message: types.Message | None) -> AudioMeta | None:
             title=message.audio.title,
         )
 
-    if (    message.document
+    if (
+        message.document
         and message.document.mime_type
         and message.document.mime_type.startswith("audio/")
     ):
-
         return AudioMeta(
             file_unique_id=message.document.file_unique_id,
             file_name=message.document.file_name,
@@ -2431,8 +2369,7 @@ async def _get_media_total(
     media_filter: MessagesFilter,
     is_incremental: bool,
 ) -> int | None:
-    """
-    Пытается получить общее количество сообщений для прогресса.
+    """Пытается получить общее количество сообщений для прогресса.
     Возвращает None если не удалось или не нужно (инкрементальный режим).
     """
     if is_incremental:
@@ -2449,8 +2386,7 @@ async def sync_messages(
     chat_id: ChatID,
     conn: aiosqlite.Connection,
 ) -> None:
-    """
-    Синхронизация: поиск AUDIO + DOCUMENT на серверах Telegram.
+    """Синхронизация: поиск AUDIO + DOCUMENT на серверах Telegram.
 
     • Каждый батч коммитится отдельно.
     • Курсор обновляется ТОЛЬКО в конце.
@@ -2460,14 +2396,13 @@ async def sync_messages(
 
     # ── 1. Читаем состояние ──────────────────────────────────
     async with conn.execute(
-        "SELECT is_fully_synced, newest_scanned_id "
-        "FROM chat_sync_state WHERE chat_id = ?",
+        "SELECT is_fully_synced, newest_scanned_id FROM chat_sync_state WHERE chat_id = ?",
         (chat_id,),
     ) as c:
         row = await c.fetchone()
 
     is_fully_synced = row[0] if row else 0
-    db_newest_id    = row[1] if row else 0
+    db_newest_id = row[1] if row else 0
 
     max_id_found = db_newest_id
     try:
@@ -2486,7 +2421,7 @@ async def sync_messages(
         log.info(f"Инкрементальная синхронизация (ID > {db_newest_id})")
 
     FILTERS_MAP = {
-        MessagesFilter.AUDIO:    "АУДИО",
+        MessagesFilter.AUDIO: "АУДИО",
         MessagesFilter.DOCUMENT: "ДОКУМЕНТЫ",
     }
 
@@ -2496,7 +2431,10 @@ async def sync_messages(
     try:
         for media_filter, filter_name in FILTERS_MAP.items():
             total_count = await _get_media_total(
-                app, chat_id, media_filter, is_incremental,
+                app,
+                chat_id,
+                media_filter,
+                is_incremental,
             )
 
             batch: list[tuple] = []
@@ -2505,7 +2443,9 @@ async def sync_messages(
             last_log_time = time.monotonic()
 
             async for message in app.search_messages(
-                chat_id, filter=media_filter, **search_kwargs,
+                chat_id,
+                filter=media_filter,
+                **search_kwargs,
             ):
                 scanned += 1
 
@@ -2514,23 +2454,19 @@ async def sync_messages(
 
                 audio_attrs = _get_audio_attributes(message)
                 if audio_attrs:
-                    batch.append(
-                        (message.chat.id, message.id, *audio_attrs)
-                    )
+                    batch.append((message.chat.id, message.id, *audio_attrs))
 
                 # ── батч заполнен → коммитим ─────────────────
                 if len(batch) >= SYNC_BATCH_SIZE:
                     added = await _flush_audio_batch(conn, batch)
                     filter_added += added
-                    total_added  += added
+                    total_added += added
                     batch.clear()
 
                 # ── периодический лог ────────────────────────
                 now = time.monotonic()
                 if now - last_log_time >= LOG_INTERVAL:
-                    progress = (
-                        f" / {total_count}" if total_count else ""
-                    )
+                    progress = f" / {total_count}" if total_count else ""
                     log.info(
                         f"  {filter_name}: "
                         f"просмотрено {scanned}{progress}, "
@@ -2542,13 +2478,10 @@ async def sync_messages(
             if batch:
                 added = await _flush_audio_batch(conn, batch)
                 filter_added += added
-                total_added  += added
+                total_added += added
                 batch.clear()
 
-            log.info(
-                f"  {filter_name}: готово. "
-                f"Просмотрено {scanned}, добавлено {filter_added}"
-            )
+            log.info(f"  {filter_name}: готово. Просмотрено {scanned}, добавлено {filter_added}")
 
         # ── 3. Фиксируем курсор ─────────────────────────────
         await conn.execute(
@@ -2563,7 +2496,8 @@ async def sync_messages(
     except Exception as e:
         await conn.rollback()
         log.error(
-            f"Ошибка синхронизации чата {chat_label(chat_id)}: {e}", exc_info=True,
+            f"Ошибка синхронизации чата {chat_label(chat_id)}: {e}",
+            exc_info=True,
         )
         raise
 
@@ -2574,12 +2508,12 @@ async def sync_messages(
 
 
 async def find_and_process_duplicates(
-    app: Client, chat_id: ChatID, conn: aiosqlite.Connection,
+    app: Client,
+    chat_id: ChatID,
+    conn: aiosqlite.Connection,
     archive_target_id: ChatID | None = None,
 ) -> None:
-    """
-    ЭТАП 2 (Оркестратор): Анализирует дубликаты и формирует списки действий.
-    """
+    """ЭТАП 2 (Оркестратор): Анализирует дубликаты и формирует списки действий."""
     log.info(f"\n{'=' * 10}\nНачинаю анализ дубликатов в чате {chat_label(chat_id)}...")
 
     # Шаг 1: Найти группы потенциальных дубликатов в локальной базе данных
@@ -2593,9 +2527,7 @@ async def find_and_process_duplicates(
     )
 
     # Шаг 2: Проверить все сообщения из этих групп, запросив их у Telegram
-    ids_to_verify = list(
-        {record["message_id"] for group in potential_groups for record in group}
-    )
+    ids_to_verify = list({record["message_id"] for group in potential_groups for record in group})
     verified_messages = await _verify_messages_from_api(app, chat_id, ids_to_verify)
 
     # Шаг 3: Классифицировать дубликаты на основе верифицированных данных
@@ -2605,14 +2537,18 @@ async def find_and_process_duplicates(
 
     # Шаг 4: Передать отсортированные списки на исполнение
     await handle_database_changes(
-        app, chat_id, conn, sorted(list(tg_ids)), sorted(list(db_ids)), update_records,
+        app,
+        chat_id,
+        conn,
+        sorted(list(tg_ids)),
+        sorted(list(db_ids)),
+        update_records,
         archive_target_id=archive_target_id,
     )
 
 
 def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[DuplicateGroup], EdgeMeta]:
-    """
-    (ЧИСТАЯ ФУНКЦИЯ) Группирует записи, используя обход графа
+    """(ЧИСТАЯ ФУНКЦИЯ) Группирует записи, используя обход графа
     для нахождения связных компонентов (транзитивных связей).
 
     Returns:
@@ -2629,7 +2565,13 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
     for rec in all_audios:
         msg_id = rec["message_id"]
         uid_to_ids[rec["file_unique_id"]].append(msg_id)
-        meta_key = (rec["file_name"], rec["performer"], rec["title"], rec["file_size"], rec["duration"])
+        meta_key = (
+            rec["file_name"],
+            rec["performer"],
+            rec["title"],
+            rec["file_size"],
+            rec["duration"],
+        )
         meta_to_ids[meta_key].append(msg_id)
 
     potential_duplicate_groups = []
@@ -2651,12 +2593,18 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
             rec = id_to_record[curr_id]
 
             neighbors_uid = uid_to_ids.get(rec["file_unique_id"], [])
-            meta_key = (rec["file_name"], rec["performer"], rec["title"], rec["file_size"], rec["duration"])
+            meta_key = (
+                rec["file_name"],
+                rec["performer"],
+                rec["title"],
+                rec["file_size"],
+                rec["duration"],
+            )
             neighbors_meta = meta_to_ids.get(meta_key, [])
 
             for neighbor_id, reason in itertools.chain(
-                    ((n, "uid") for n in neighbors_uid),
-                    ((n, "meta") for n in neighbors_meta),
+                ((n, "uid") for n in neighbors_uid),
+                ((n, "meta") for n in neighbors_meta),
             ):
                 if neighbor_id == curr_id:
                     continue
@@ -2664,8 +2612,12 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
                 # uid имеет приоритет над meta при описании причины
                 if reason == "uid" or key not in edge_meta:
                     edge_meta[key] = EdgeInfo(
-                        reason=reason, score=1.0,
-                        name=None, dur=None, size=None, penalty=0.0,
+                        reason=reason,
+                        score=1.0,
+                        name=None,
+                        dur=None,
+                        size=None,
+                        penalty=0.0,
                     )
                 if neighbor_id not in processed_ids:
                     processed_ids.add(neighbor_id)  # Mark-on-push
@@ -2685,25 +2637,27 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
 # ─────────────────────────────────────────────────────────────
 
 _DOMAINS = r"(?:net|com|ru|me|fm|tv|org|biz|info|cc|xyz|ua|by|kz|top|click|su|pm)"
-_MEDIA_EXT = r"mp3|m4a|m4b|flac|wav|ogg|ogx|wma|aac|alac|aiff|ape|opus|wv|webm|mp4|avi|wmv|mkv|flv|mov"
+_MEDIA_EXT = (
+    r"mp3|m4a|m4b|flac|wav|ogg|ogx|wma|aac|alac|aiff|ape|opus|wv|webm|mp4|avi|wmv|mkv|flv|mov"
+)
 _TRASH_SITES = r"(?:muzlome|myzuka|zaycev(?:_?net)?|zvuk|muzofon|hitmo|pesni|lightaudio(?:_ru)?|ruapporangespace|mp3pulse(?:_ru)?|jamix(?:_cc)?|ipleer(?:_com)?|skysound(?:_cc)?|vk4(?:_ru)?)"
 
-_RE_EXT          = re.compile(rf"(?:\.(?:{_MEDIA_EXT}))+$", re.IGNORECASE)
-_RE_BRACKETS_AD  = re.compile(rf"[\[\(][^\]\)]*\b[\w-]+\.{_DOMAINS}\b[^\]\)]*[\]\)]", re.IGNORECASE)
-_RE_WWW          = re.compile(r"(?:www[._]|https?://|ftp://)", re.IGNORECASE)
-_RE_URLS         = re.compile(rf"\b[a-z0-9]+\.{_DOMAINS}\b", re.IGNORECASE)
-_RE_PURE_ID      = re.compile(r"^\d{1,5}[\s_\-]\d{10,}$")
+_RE_EXT = re.compile(rf"(?:\.(?:{_MEDIA_EXT}))+$", re.IGNORECASE)
+_RE_BRACKETS_AD = re.compile(rf"[\[\(][^\]\)]*\b[\w-]+\.{_DOMAINS}\b[^\]\)]*[\]\)]", re.IGNORECASE)
+_RE_WWW = re.compile(r"(?:www[._]|https?://|ftp://)", re.IGNORECASE)
+_RE_URLS = re.compile(rf"\b[a-z0-9]+\.{_DOMAINS}\b", re.IGNORECASE)
+_RE_PURE_ID = re.compile(r"^\d{1,5}[\s_\-]\d{10,}$")
 _RE_TRASH_PREFIX = re.compile(rf"^{_TRASH_SITES}[_.\-\s]+", re.IGNORECASE)
-_RE_NUM_PREFIX   = re.compile(r"^\d{5,7}[\s_\-]+", re.IGNORECASE)
+_RE_NUM_PREFIX = re.compile(r"^\d{5,7}[\s_\-]+", re.IGNORECASE)
 _RE_TRASH_SUFFIX = re.compile(rf"[_.\-\s]+{_TRASH_SITES}[_.\-\s]*$", re.IGNORECASE)
-_RE_COPY_SUFFIX  = re.compile(r"[\s_\-]*[\(\[]\d[\)\]]$")
-_RE_TRASH_IDS    = re.compile(r"(?<=[a-zа-яё\d])[\s_\-]+\d{7,}(?:[\s_\-]+\d{1,4})?$", re.IGNORECASE)
-_RE_DIGITS       = re.compile(r"\d+")
+_RE_COPY_SUFFIX = re.compile(r"[\s_\-]*[\(\[]\d[\)\]]$")
+_RE_TRASH_IDS = re.compile(r"(?<=[a-zа-яё\d])[\s_\-]+\d{7,}(?:[\s_\-]+\d{1,4})?$", re.IGNORECASE)
+_RE_DIGITS = re.compile(r"\d+")
 _RE_META_PLACEHOLDER = re.compile(
     r"^\s*(?:<\s*unknown\s*>|\[\s*unknown\s*\])\s*$",
     re.IGNORECASE,
 )
-#_RE_HASH_SUFFIX = re.compile(r"[\s_\-]+(?=[A-Z0-9]*\d)[A-Z0-9]{6}$")
+# _RE_HASH_SUFFIX = re.compile(r"[\s_\-]+(?=[A-Z0-9]*\d)[A-Z0-9]{6}$")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2730,7 +2684,7 @@ def _clean_filename(fname: str | None) -> str:
     original = fname
     s = fname
     s = _RE_EXT.sub("", s)
-    #s = _RE_HASH_SUFFIX.sub("", s)
+    # s = _RE_HASH_SUFFIX.sub("", s)
     s = s.lower()
 
     s = _RE_COPY_SUFFIX.sub(" ", s)
@@ -2776,10 +2730,7 @@ def _clean_meta(performer: str | None, title: str | None) -> str:
     в одной форме. Плейсхолдеры вида '<unknown>' отбрасываются как
     отсутствующие значения. Пусто, если не осталось ни performer, ни title.
     """
-    parts = [
-        p for p in (performer, title)
-        if p and not _RE_META_PLACEHOLDER.match(p)
-    ]
+    parts = [p for p in (performer, title) if p and not _RE_META_PLACEHOLDER.match(p)]
     if not parts:
         return ""
     return _clean_filename(" ".join(parts))
@@ -2793,15 +2744,15 @@ def _src_suffix(src: int | None) -> str:
 def _prepare_arrays(
     sorted_rows: list[DBRow],
 ) -> tuple[
-    np.ndarray,        # ids
-    np.ndarray,        # durations
-    np.ndarray,        # sizes
-    list[str],         # names (очищённые)
-    list[str],         # names_processed
-    list[str],         # metas_processed
-    np.ndarray,        # name_lengths
-    list[set[int]],    # numbers_cache (числа из имени)
-    list[set[int]],    # meta_numbers_cache (числа из меты)
+    np.ndarray,  # ids
+    np.ndarray,  # durations
+    np.ndarray,  # sizes
+    list[str],  # names (очищённые)
+    list[str],  # names_processed
+    list[str],  # metas_processed
+    np.ndarray,  # name_lengths
+    list[set[int]],  # numbers_cache (числа из имени)
+    list[set[int]],  # meta_numbers_cache (числа из меты)
     list[str | None],  # uids
     dict[int, DBRow],  # id_to_row
 ]:
@@ -2818,9 +2769,9 @@ def _prepare_arrays(
         списки имён (сырых и обработанных), мета, длины имён, кэш числовых множеств,
         список UID-ов и словарь message_id → DBRow.
     """
-    ids       = np.array([r["message_id"]       for r in sorted_rows], dtype=np.int64)
-    durations = np.array([r["duration"] or 0    for r in sorted_rows], dtype=np.int32)
-    sizes     = np.array([r["file_size"] or 0   for r in sorted_rows], dtype=np.float64)
+    ids = np.array([r["message_id"] for r in sorted_rows], dtype=np.int64)
+    durations = np.array([r["duration"] or 0 for r in sorted_rows], dtype=np.int32)
+    sizes = np.array([r["file_size"] or 0 for r in sorted_rows], dtype=np.float64)
 
     names = [_clean_filename(r["file_name"]) for r in sorted_rows]
     names_processed = [_process_for_fuzzy(n) for n in names]
@@ -2839,10 +2790,17 @@ def _prepare_arrays(
     id_to_row = {r["message_id"]: r for r in sorted_rows}
 
     return (
-        ids, durations, sizes,
-        names, names_processed, metas_processed,
-        name_lengths, numbers_cache, meta_numbers_cache,
-        uids, id_to_row,
+        ids,
+        durations,
+        sizes,
+        names,
+        names_processed,
+        metas_processed,
+        name_lengths,
+        numbers_cache,
+        meta_numbers_cache,
+        uids,
+        id_to_row,
     )
 
 
@@ -2929,17 +2887,17 @@ def _compute_window_scores(
     window_size = window_end - (i + 1)
 
     dynamic_thresholds = buf_thresholds[:window_size]
-    scores_dur         = buf_scores_dur[:window_size]
-    scores_size        = buf_scores_size[:window_size]
+    scores_dur = buf_scores_dur[:window_size]
+    scores_size = buf_scores_size[:window_size]
 
     dynamic_thresholds.fill(base_threshold)
     scores_dur.fill(0.0)
     scores_size.fill(0.0)
 
-    current_dur  = durations[i]
-    neigh_durs   = durations[i + 1 : window_end]
-    curr_size    = sizes[i]
-    neigh_sizes  = sizes[i + 1 : window_end]
+    current_dur = durations[i]
+    neigh_durs = durations[i + 1 : window_end]
+    curr_size = sizes[i]
+    neigh_sizes = sizes[i + 1 : window_end]
 
     # Длительность
     valid_dur_mask = (neigh_durs > 0) & (current_dur > 0)
@@ -2947,7 +2905,7 @@ def _compute_window_scores(
         vi = np.flatnonzero(valid_dur_mask)
         v = neigh_durs[vi]
         ratio_dur = np.minimum(v / current_dur, current_dur / v)
-        scores_dur[vi] = ratio_dur ** dur_power
+        scores_dur[vi] = ratio_dur**dur_power
 
     invalid_dur_mask = ~valid_dur_mask
     if np.any(invalid_dur_mask):
@@ -2959,7 +2917,7 @@ def _compute_window_scores(
         vi = np.flatnonzero(valid_size_mask)
         v = neigh_sizes[vi]
         ratio_size = np.minimum(v / curr_size, curr_size / v)
-        scores_size[vi] = ratio_size ** size_power
+        scores_size[vi] = ratio_size**size_power
 
     invalid_size_mask = ~valid_size_mask
     if np.any(invalid_size_mask):
@@ -3008,14 +2966,14 @@ def _optimistic_filter(
     """
     if fuzzy_mode != "set" and not use_meta:
         curr_len = float(name_lengths[i])
-        neigh_lens = name_lengths[i + 1: window_end].astype(np.float64)
+        neigh_lens = name_lengths[i + 1 : window_end].astype(np.float64)
         sum_lens = neigh_lens + curr_len
         max_name_ratio = np.where(
             sum_lens > 0,
             2.0 * np.minimum(neigh_lens, curr_len) / sum_lens,
             0.0,
         )
-        max_name_score = max_name_ratio ** name_power
+        max_name_score = max_name_ratio**name_power
         max_potential = w_name * max_name_score + w_dur * scores_dur + w_size * scores_size
     else:
         max_potential = w_name * 1.0 + w_dur * scores_dur + w_size * scores_size
@@ -3043,7 +3001,7 @@ def _compute_penalty(
     if current_numbers == candidate_numbers:
         return 0.0
     if USE_JACCARD_PENALTY and (current_numbers or candidate_numbers):
-        union        = len(current_numbers | candidate_numbers)
+        union = len(current_numbers | candidate_numbers)
         intersection = len(current_numbers & candidate_numbers)
         return PENALTY_NUMBERS_MISMATCH * (1.0 - intersection / union) if union else 0.0
     return PENALTY_NUMBERS_MISMATCH
@@ -3073,15 +3031,15 @@ def _filter_already_connected(
     if not adjacency_i:
         return abs_indices, valid_indices_relative, 0
 
-    mask           = np.ones(abs_indices.size, dtype=bool)
-    skipped        = 0
+    mask = np.ones(abs_indices.size, dtype=bool)
+    skipped = 0
     for k, abs_idx in enumerate(abs_indices.tolist()):
         if int(ids[abs_idx]) in adjacency_i:
             mask[k] = False
             skipped += 1
 
     if skipped:
-        abs_indices            = abs_indices[mask]
+        abs_indices = abs_indices[mask]
         valid_indices_relative = valid_indices_relative[mask]
 
     return abs_indices, valid_indices_relative, skipped
@@ -3163,7 +3121,9 @@ def _match_batch(
             abs_indices = abs_indices[possible_mask]
             valid_indices_relative = valid_indices_relative[possible_mask]
 
-        min_raw_scores = np.maximum(0.0, min_name_powered_scores[possible_mask]) ** (1.0 / name_power)
+        min_raw_scores = np.maximum(0.0, min_name_powered_scores[possible_mask]) ** (
+            1.0 / name_power
+        )
         global_cutoff = float(np.min(min_raw_scores)) * 100.0
     else:
         global_cutoff = 0.0
@@ -3190,31 +3150,36 @@ def _match_batch(
     choices = candidate_names + (candidate_metas if has_candidate_meta else [])
 
     dist = process.cdist(
-        queries, choices, scorer=fuzz_scorer, processor=None,
-        dtype=np.float64, score_cutoff=global_cutoff, workers=1,
+        queries,
+        choices,
+        scorer=fuzz_scorer,
+        processor=None,
+        dtype=np.float64,
+        score_cutoff=global_cutoff,
+        workers=1,
     )
 
     # Собираем матрицу источников (P, n), fuzzy 0..100, срезами из dist.
-    score_rows: list[np.ndarray] = [dist[0, 0:n]]          # NN — всегда
+    score_rows: list[np.ndarray] = [dist[0, 0:n]]  # NN — всегда
     src_codes: list[int] = [_SRC_NN]
     if has_candidate_meta:
-        score_rows.append(dist[0, n:2 * n])                # NM
+        score_rows.append(dist[0, n : 2 * n])  # NM
         src_codes.append(_SRC_NM)
     if current_meta:
-        score_rows.append(dist[1, 0:n])                    # MN
+        score_rows.append(dist[1, 0:n])  # MN
         src_codes.append(_SRC_MN)
         if has_candidate_meta:
-            score_rows.append(dist[1, n:2 * n])            # MM
+            score_rows.append(dist[1, n : 2 * n])  # MM
             src_codes.append(_SRC_MM)
 
-    stacked = np.vstack(score_rows)                         # (P, n)
+    stacked = np.vstack(score_rows)  # (P, n)
     src_arr = np.asarray(src_codes, dtype=np.int8)
     meta_src_rows = [p for p, s in enumerate(src_codes) if s in (_SRC_NM, _SRC_MM)]
     mask_phantoms = has_candidate_meta and bool(empty_meta_mask.any()) and meta_src_rows
 
     # ── Stage 1: оптимистичный отбор (penalty=0 -> верхняя граница) ──
     powered_stacked = (stacked / 100.0) ** name_power
-    optimistic = powered_stacked * w_name                  # (P, n)
+    optimistic = powered_stacked * w_name  # (P, n)
     if mask_phantoms:
         for p in meta_src_rows:
             optimistic[p, empty_meta_mask] = -np.inf
@@ -3224,8 +3189,8 @@ def _match_batch(
     if not np.any(survive):
         return comparisons, 0, []
 
-    surv_idx = np.flatnonzero(survive)                     # позиции в массиве кандидатов
-    surv_scores = stacked[:, surv_idx]                     # (P, S)
+    surv_idx = np.flatnonzero(survive)  # позиции в массиве кандидатов
+    surv_scores = stacked[:, surv_idx]  # (P, S)
 
     # ── Stage 2: реальный penalty только для выживших ──
     p_count = surv_scores.shape[0]
@@ -3250,7 +3215,7 @@ def _match_batch(
     best_idx = np.argmax(adjusted, axis=0)
     cols = np.arange(surv_idx.size)
     fuzzy_scores_raw = surv_scores[best_idx, cols] / 100.0
-    fuzzy_scores = fuzzy_scores_raw ** name_power
+    fuzzy_scores = fuzzy_scores_raw**name_power
     penalties = penalty_stacked[best_idx, cols]
     src_per_cand = src_arr[best_idx]
 
@@ -3314,8 +3279,8 @@ def _build_groups_bfs(
     Returns:
         Список компонент с размером ≥ 2 (одиночные файлы исключены).
     """
-    groups       = []
-    processed    = set()
+    groups = []
+    processed = set()
 
     for item_id in ids.tolist():
         if item_id in processed or item_id not in adjacency:
@@ -3372,15 +3337,17 @@ def _log_stats(
     if t_loop > 0 and stats_comparisons > 0:
         ops = stats_comparisons / t_loop
         ops_str = (
-            f"{ops / 1_000_000:.2f}M" if ops >= 1_000_000
-            else f"{ops / 1_000:.1f}K" if ops >= 1_000
+            f"{ops / 1_000_000:.2f}M"
+            if ops >= 1_000_000
+            else f"{ops / 1_000:.1f}K"
+            if ops >= 1_000
             else f"{ops:.0f}"
         )
     else:
         ops_str = "N/A"
 
     overhead_per_file = (t_loop * 1000 / count) if count > 0 else 0
-    avg_candidates    = stats_comparisons / count if count > 0 else 0
+    avg_candidates = stats_comparisons / count if count > 0 else 0
 
     log.info(
         f"Fuzzy-поиск: {stats_comparisons:,} пар-кандидатов, "
@@ -3418,6 +3385,7 @@ def _log_stats(
 # Оркестратор
 # ─────────────────────────────────────────────────────────────
 
+
 def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[DuplicateGroup], EdgeMeta]:
     """Находит группы дубликатов аудиофайлов через fuzzy matching.
 
@@ -3445,25 +3413,34 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
     # 1. Подготовка
     t_prep_start = time.perf_counter()
     sorted_rows = sorted(all_audios, key=lambda r: r["duration"] or 0)
-    (ids, durations, sizes,
-     names, names_processed, metas_processed,
-     name_lengths, numbers_cache, meta_numbers_cache,
-     uids, id_to_row) = _prepare_arrays(sorted_rows)
+    (
+        ids,
+        durations,
+        sizes,
+        names,
+        names_processed,
+        metas_processed,
+        name_lengths,
+        numbers_cache,
+        meta_numbers_cache,
+        uids,
+        id_to_row,
+    ) = _prepare_arrays(sorted_rows)
 
     BASE_THRESHOLD = FUZZY_THRESHOLD
-    W_NAME  = WEIGHT_NAME
-    W_DUR   = WEIGHT_DURATION
-    W_SIZE  = WEIGHT_SIZE
+    W_NAME = WEIGHT_NAME
+    W_DUR = WEIGHT_DURATION
+    W_SIZE = WEIGHT_SIZE
     MAX_DIFF = MAX_DURATION_DIFF_SEC
     NAME_PWR = NAME_POWER
     DUR_POWER = DURATION_POWER
     SZ_POWER = SIZE_POWER
 
-    window_ends      = np.searchsorted(durations, durations + MAX_DIFF, side="right")
-    max_window_size  = max(1, int(np.max(window_ends - np.arange(count) - 1)))
-    buf_thresholds   = np.empty(max_window_size, dtype=np.float64)
-    buf_scores_dur   = np.empty(max_window_size, dtype=np.float64)
-    buf_scores_size  = np.empty(max_window_size, dtype=np.float64)
+    window_ends = np.searchsorted(durations, durations + MAX_DIFF, side="right")
+    max_window_size = max(1, int(np.max(window_ends - np.arange(count) - 1)))
+    buf_thresholds = np.empty(max_window_size, dtype=np.float64)
+    buf_scores_dur = np.empty(max_window_size, dtype=np.float64)
+    buf_scores_size = np.empty(max_window_size, dtype=np.float64)
 
     if FUZZY_MATCHING_MODE == "set":
         fuzz_scorer = fuzz.token_set_ratio
@@ -3480,35 +3457,59 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
     t_prep_end = time.perf_counter()
 
     # 3. Основной цикл (Sliding Window)
-    t_loop_start             = time.perf_counter()
-    stats_comparisons        = 0
-    stats_matches            = 0
-    stats_skipped_connected  = 0
+    t_loop_start = time.perf_counter()
+    stats_comparisons = 0
+    stats_matches = 0
+    stats_skipped_connected = 0
     all_match_scores: list[float] = []
 
     match_kwargs = dict(
-        ids=ids, names=names, names_processed=names_processed,
+        ids=ids,
+        names=names,
+        names_processed=names_processed,
         metas_processed=metas_processed,
-        numbers_cache=numbers_cache, meta_numbers_cache=meta_numbers_cache,
+        numbers_cache=numbers_cache,
+        meta_numbers_cache=meta_numbers_cache,
         fuzz_scorer=fuzz_scorer,
-        w_name=W_NAME, w_dur=W_DUR, w_size=W_SIZE, name_power=NAME_PWR, adjacency=adjacency,
+        w_name=W_NAME,
+        w_dur=W_DUR,
+        w_size=W_SIZE,
+        name_power=NAME_PWR,
+        adjacency=adjacency,
         edge_meta=edge_meta,
     )
 
     for i in range(count):
-        window_end  = window_ends[i]
+        window_end = window_ends[i]
         if window_end <= i + 1:
             continue
 
         dynamic_thresholds, scores_dur, scores_size = _compute_window_scores(
-            i, window_end, durations, sizes,
-            buf_thresholds, buf_scores_dur, buf_scores_size,
-            BASE_THRESHOLD, W_DUR, W_SIZE, DUR_POWER, SZ_POWER,
+            i,
+            window_end,
+            durations,
+            sizes,
+            buf_thresholds,
+            buf_scores_dur,
+            buf_scores_size,
+            BASE_THRESHOLD,
+            W_DUR,
+            W_SIZE,
+            DUR_POWER,
+            SZ_POWER,
         )
 
         candidates_mask = _optimistic_filter(
-            i, window_end, name_lengths, scores_dur, scores_size,
-            dynamic_thresholds, W_NAME, W_DUR, W_SIZE, NAME_PWR,
+            i,
+            window_end,
+            name_lengths,
+            scores_dur,
+            scores_size,
+            dynamic_thresholds,
+            W_NAME,
+            W_DUR,
+            W_SIZE,
+            NAME_PWR,
             FUZZY_MATCHING_MODE,
             USE_META_FUZZY,
         )
@@ -3516,11 +3517,14 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
             continue
 
         valid_indices_relative = np.flatnonzero(candidates_mask)
-        abs_indices            = valid_indices_relative + (i + 1)
-        id_i                   = int(ids[i])
+        abs_indices = valid_indices_relative + (i + 1)
+        id_i = int(ids[i])
 
         abs_indices, valid_indices_relative, skipped = _filter_already_connected(
-            abs_indices, valid_indices_relative, ids, adjacency.get(id_i),
+            abs_indices,
+            valid_indices_relative,
+            ids,
+            adjacency.get(id_i),
         )
         stats_skipped_connected += skipped
         if abs_indices.size == 0:
@@ -3538,14 +3542,14 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
         all_match_scores.extend(scores)
 
         stats_comparisons += c
-        stats_matches     += m
+        stats_matches += m
 
     t_loop_end = time.perf_counter()
 
     # 4. Сборка групп BFS
     t_bfs_start = time.perf_counter()
-    groups      = _build_groups_bfs(ids, adjacency, id_to_row)
-    t_bfs_end   = time.perf_counter()
+    groups = _build_groups_bfs(ids, adjacency, id_to_row)
+    t_bfs_end = time.perf_counter()
 
     # 5. Статистика
     _log_stats(
@@ -3569,9 +3573,12 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
 # Стратегия выбора оригинала (keep_priority)
 # ─────────────────────────────────────────────────────────────
 
+
 class KeepCriterion(NamedTuple):
     """extract возвращает числовое значение критерия или None (= значение
-    отсутствует; такая запись проигрывает записям, у которых оно есть)."""
+    отсутствует; такая запись проигрывает записям, у которых оно есть).
+    """
+
     extract: Callable[[DBRow], float | None]
     prefer_max: bool
 
@@ -3580,25 +3587,35 @@ def _extract_positive(field: str) -> Callable[[DBRow], float | None]:
     def inner(r: DBRow) -> float | None:
         v = r[field]
         return float(v) if v and v > 0 else None
+
     return inner
 
 
-_META_PLACEHOLDERS: Final[frozenset[str]] = frozenset({
-    "<unknown>", "unknown", "unknown artist", "[unknown]",
-})
+_META_PLACEHOLDERS: Final[frozenset[str]] = frozenset(
+    {
+        "<unknown>",
+        "unknown",
+        "unknown artist",
+        "[unknown]",
+    }
+)
+
 
 def _meta_field_ok(value: str | None) -> bool:
     v = (value or "").strip()
     return bool(v) and v.lower() not in _META_PLACEHOLDERS
 
+
 def _extract_has_meta(r: DBRow) -> float:
     """0..2: качество тегов. Плейсхолдеры и title, совпадающий с именем
-    файла (мусор от сайтов-качалок), не считаются метаданными."""
+    файла (мусор от сайтов-качалок), не считаются метаданными.
+    """
     score = 0.0
     if _meta_field_ok(r["performer"]):
         score += 1.0
-    if _meta_field_ok(r["title"]) and \
-            _clean_filename(r["title"]) != _clean_filename(r["file_name"]):
+    if _meta_field_ok(r["title"]) and _clean_filename(r["title"]) != _clean_filename(
+        r["file_name"]
+    ):
         score += 1.0
     return score
 
@@ -3609,19 +3626,20 @@ def _extract_clean_name_len(r: DBRow) -> float | None:
 
 
 _KEEP_CRITERIA: Final[dict[str, KeepCriterion]] = {
-    "oldest":             KeepCriterion(lambda r: float(r["message_id"]), prefer_max=False),
-    "newest":             KeepCriterion(lambda r: float(r["message_id"]), prefer_max=True),
-    "largest":            KeepCriterion(_extract_positive("file_size"), prefer_max=True),
-    "smallest":           KeepCriterion(_extract_positive("file_size"), prefer_max=False),
-    "longest":            KeepCriterion(_extract_positive("duration"), prefer_max=True),
-    "shortest":           KeepCriterion(_extract_positive("duration"), prefer_max=False),
-    "best_meta":          KeepCriterion(_extract_has_meta, prefer_max=True),
+    "oldest": KeepCriterion(lambda r: float(r["message_id"]), prefer_max=False),
+    "newest": KeepCriterion(lambda r: float(r["message_id"]), prefer_max=True),
+    "largest": KeepCriterion(_extract_positive("file_size"), prefer_max=True),
+    "smallest": KeepCriterion(_extract_positive("file_size"), prefer_max=False),
+    "longest": KeepCriterion(_extract_positive("duration"), prefer_max=True),
+    "shortest": KeepCriterion(_extract_positive("duration"), prefer_max=False),
+    "best_meta": KeepCriterion(_extract_has_meta, prefer_max=True),
     "longest_clean_name": KeepCriterion(_extract_clean_name_len, prefer_max=True),
 }
 
 # Ловим рассинхрон реестра и валидации конфига на импорте, а не в рантайме
-assert set(_KEEP_CRITERIA) == _KEEP_CRITERIA_VALID, \
+assert set(_KEEP_CRITERIA) == _KEEP_CRITERIA_VALID, (
     "Реестр критериев main.py разошёлся с _KEEP_CRITERIA_VALID в config.py"
+)
 
 
 def _cascade_winner(pool: list[DBRow]) -> DBRow:
@@ -3667,8 +3685,7 @@ def _order_group_by_keep_priority(group: DuplicateGroup) -> list[DBRow]:
 async def _get_potential_duplicate_groups(
     chat_id: ChatID, conn: aiosqlite.Connection
 ) -> tuple[list[DuplicateGroup], EdgeMeta]:
-    """
-    ЭТАП 2.1: Запрашивает из БД все аудио и передает их чистой функции для группировки.
+    """ЭТАП 2.1: Запрашивает из БД все аудио и передает их чистой функции для группировки.
     Возвращает группы дубликатов и метаданные связей (причина + коэффициенты)
     для отчёта.
     """
@@ -3676,9 +3693,7 @@ async def _get_potential_duplicate_groups(
     # Лимит тележки на сообщения 1 млн, т.е. на 1 чат максимум 1 млн записей, что не бьёт по ОЗУ
     # Но фактически маловероятно, что есть чаты, где аудиофайлов больше, чем 300 тыс., что максимум для 512 МБ - 1 ГБ ОЗУ
     # Т.е. здесь сделано верно
-    async with conn.execute(
-        "SELECT * FROM audios WHERE chat_id = ?", (chat_id,)
-    ) as cursor:
+    async with conn.execute("SELECT * FROM audios WHERE chat_id = ?", (chat_id,)) as cursor:
         all_audios = await cursor.fetchall()
 
     if not all_audios:
@@ -3697,8 +3712,7 @@ async def _get_potential_duplicate_groups(
 async def _verify_messages_from_api(
     app: Client, chat_id: ChatID, ids_to_verify: list[MessageID]
 ) -> VerifiedMessagesDict:
-    """
-    ЭТАП 2.2: Надежно запрашивает у Telegram информацию о сообщениях по их ID.
+    """ЭТАП 2.2: Надежно запрашивает у Telegram информацию о сообщениях по их ID.
     Использует семафор для контроля параллельных запросов и пакетирование.
     """
     verified_messages = {}
@@ -3709,40 +3723,29 @@ async def _verify_messages_from_api(
             try:
                 return await app.get_messages(chat_id, chunk_ids)
             except Exception as e:
-                log.error(
-                    f"Ошибка при получении пакета сообщений (ID: {chunk_ids[0]}...): {e}."
-                )
+                log.error(f"Ошибка при получении пакета сообщений (ID: {chunk_ids[0]}...): {e}.")
                 return e
 
-    original_chunks = [
-        list(chunk) for chunk in itertools.batched(ids_to_verify, VERIFY_CHUNK_SIZE)
-    ]
+    original_chunks = [list(chunk) for chunk in itertools.batched(ids_to_verify, VERIFY_CHUNK_SIZE)]
     tasks = [fetch_chunk(chunk) for chunk in original_chunks]
     results_from_gather = await asyncio.gather(*tasks)
 
-    for original_chunk, result_chunk in zip(
-        original_chunks, results_from_gather, strict=True
-    ):
+    for original_chunk, result_chunk in zip(original_chunks, results_from_gather, strict=True):
         if isinstance(result_chunk, Exception):
             for msg_id in original_chunk:
-                verified_messages[msg_id] = (
-                    result_chunk
-                )
+                verified_messages[msg_id] = result_chunk
         else:
             found_messages = {msg.id: msg for msg in result_chunk if msg}
             for msg_id in original_chunk:
-                verified_messages[msg_id] = found_messages.get(
-                    msg_id
-                )
+                verified_messages[msg_id] = found_messages.get(msg_id)
 
     return verified_messages
 
 
 def _classify_verified_duplicates(
-        duplicate_groups: list[DuplicateGroup], verified_messages: VerifiedMessagesDict
+    duplicate_groups: list[DuplicateGroup], verified_messages: VerifiedMessagesDict
 ) -> ClassificationResult:
-    """
-    ЭТАП 2.3: Анализирует верифицированные сообщения и принимает решение о действиях.
+    """ЭТАП 2.3: Анализирует верифицированные сообщения и принимает решение о действиях.
 
     ВАЖНО: Использует стратегию Fail-Safe. Если при проверке любого сообщения
     в группе возникает ошибка API, вся группа пропускается для предотвращения
@@ -3784,22 +3787,19 @@ def _classify_verified_duplicates(
             api_result = verified_messages.get(msg_id)
 
             if api_result is None or api_result.empty:
-                log.debug(
-                    f"Сообщение {msg_id} не найдено в Telegram. Будет удалено из БД."
-                )
+                log.debug(f"Сообщение {msg_id} не найдено в Telegram. Будет удалено из БД.")
                 to_delete_from_db.add(msg_id)
             else:
                 api_audio_attrs = _get_audio_attributes(api_result)
                 if api_audio_attrs:
-
                     # Проверка на изменение контента
                     if (
-                            api_audio_attrs.file_unique_id == db_record["file_unique_id"]
-                            and api_audio_attrs.file_name == db_record["file_name"]
-                            and api_audio_attrs.file_size == db_record["file_size"]
-                            and api_audio_attrs.duration == db_record["duration"]
-                            and api_audio_attrs.performer == db_record["performer"]
-                            and api_audio_attrs.title == db_record["title"]
+                        api_audio_attrs.file_unique_id == db_record["file_unique_id"]
+                        and api_audio_attrs.file_name == db_record["file_name"]
+                        and api_audio_attrs.file_size == db_record["file_size"]
+                        and api_audio_attrs.duration == db_record["duration"]
+                        and api_audio_attrs.performer == db_record["performer"]
+                        and api_audio_attrs.title == db_record["title"]
                     ):
                         if not found_a_valid_original:
                             found_a_valid_original = True
@@ -3814,9 +3814,7 @@ def _classify_verified_duplicates(
                         )
                         to_update_in_db.append(api_result)
                 else:
-                    log.info(
-                        f"Сообщение {msg_id} больше не аудио. Запись будет удалена из БД."
-                    )
+                    log.info(f"Сообщение {msg_id} больше не аудио. Запись будет удалена из БД.")
                     to_delete_from_db.add(msg_id)
 
     return ClassificationResult(to_delete_from_tg, to_delete_from_db, to_update_in_db)
@@ -3826,17 +3824,21 @@ def _classify_verified_duplicates(
 
 # region --- Под-блок: Применение изменений ---
 
+
 async def _get_regex_protected_ids(
-    conn: aiosqlite.Connection, chat_id: ChatID, tg_ids: list[MessageID],
+    conn: aiosqlite.Connection,
+    chat_id: ChatID,
+    tg_ids: list[MessageID],
     patterns: list[re.Pattern[str]],
 ) -> set[MessageID]:
     """Возвращает ID сообщений, чьи file_name/performer/title матчатся
-    хотя бы одним паттерном. Читает метаданные из локальной БД."""
+    хотя бы одним паттерном. Читает метаданные из локальной БД.
+    """
     protected: set[MessageID] = set()
     CHUNK = 4000
 
     for i in range(0, len(tg_ids), CHUNK):
-        chunk = tg_ids[i:i + CHUNK]
+        chunk = tg_ids[i : i + CHUNK]
         placeholders = ",".join("?" * len(chunk))
         rows = await conn.execute_fetchall(
             f"SELECT message_id, file_name, performer, title "
@@ -3851,28 +3853,33 @@ async def _get_regex_protected_ids(
             if hit:
                 protected.add(msg_id)
                 log.info(
-                    f"Regex-защита: сообщение {msg_id} ('{hit[1]}') "
-                    f"совпало с '{hit[0].pattern}'."
+                    f"Regex-защита: сообщение {msg_id} ('{hit[1]}') совпало с '{hit[0].pattern}'."
                 )
     return protected
 
 
 async def _filter_ignored_ids(
-    conn: aiosqlite.Connection, chat_id: ChatID, tg_ids: list[MessageID],
+    conn: aiosqlite.Connection,
+    chat_id: ChatID,
+    tg_ids: list[MessageID],
 ) -> list[MessageID]:
     """Отсекает сообщения из ignore-листа и regex-защиты. Без побочных эффектов в БД."""
     ignore_list = IGNORE_MESSAGES.get(chat_id, set())
     final = [msg_id for msg_id in tg_ids if msg_id not in ignore_list]
     skipped = len(tg_ids) - len(final)
     if skipped:
-        log.info(f"Пропускаю удаление {skipped} сообщений из чата {chat_label(chat_id)} (в списке игнорирования).")
+        log.info(
+            f"Пропускаю удаление {skipped} сообщений из чата {chat_label(chat_id)} (в списке игнорирования)."
+        )
 
     patterns = IGNORE_REGEX.get(chat_id, []) + GLOBAL_IGNORE_REGEX
     if patterns and final:
         protected = await _get_regex_protected_ids(conn, chat_id, final, patterns)
         if protected:
             final = [msg_id for msg_id in final if msg_id not in protected]
-            log.info(f"Пропускаю удаление {len(protected)} сообщений из чата {chat_label(chat_id)} (regex-защита).")
+            log.info(
+                f"Пропускаю удаление {len(protected)} сообщений из чата {chat_label(chat_id)} (regex-защита)."
+            )
 
     return final
 
@@ -3917,11 +3924,11 @@ async def _send_archive_header(
 
     Косметика: падение заголовка не должно останавливать архивацию.
     """
-    #title = ""
+    # title = ""
     try:
         chat = await app.get_chat(chat_id)
         remember_chat(chat)
-        #title = (chat.title or getattr(chat, "first_name", "") or "").strip()
+        # title = (chat.title or getattr(chat, "first_name", "") or "").strip()
     except Exception:
         pass
 
@@ -4038,7 +4045,9 @@ async def _archive_and_delete_messages(
                 f"Батч {batch_num}/{total}: удалено {deleted_count}, очищено записей БД: {len(gone)}."
             )
         except Exception as e:
-            log.error(f"Не удалось удалить батч {batch_num}/{total} в чате {chat_label(chat_id)}: {e}")
+            log.error(
+                f"Не удалось удалить батч {batch_num}/{total} в чате {chat_label(chat_id)}: {e}"
+            )
 
 
 async def _delete_db_records(
@@ -4047,7 +4056,9 @@ async def _delete_db_records(
     """Удаляет устаревшие записи из БД (сообщений уже нет в TG). Не коммитит."""
     if not db_delete_ids:
         return
-    log.info(f"Чистка {len(db_delete_ids)} устаревших записей из БД для чата {chat_label(chat_id)}...")
+    log.info(
+        f"Чистка {len(db_delete_ids)} устаревших записей из БД для чата {chat_label(chat_id)}..."
+    )
     await conn.executemany(
         "DELETE FROM audios WHERE chat_id = ? AND message_id = ?",
         [(chat_id, mid) for mid in db_delete_ids],
@@ -4061,7 +4072,9 @@ async def _apply_db_updates(
     """Обновляет изменившиеся записи в БД. Не коммитит."""
     if not db_update_records:
         return
-    log.info(f"Обновление {len(db_update_records)} изменённых записей в БД для чата {chat_label(chat_id)}...")
+    log.info(
+        f"Обновление {len(db_update_records)} изменённых записей в БД для чата {chat_label(chat_id)}..."
+    )
     update_data = []
     for r in db_update_records:
         attrs = _get_audio_attributes(r)
@@ -4097,7 +4110,9 @@ async def handle_database_changes(
     final_tg_ids = await _filter_ignored_ids(conn, chat_id, tg_ids)
 
     if DRY_RUN:
-        _log_planned_changes(chat_id, final_tg_ids, db_delete_ids, db_update_records, archive_target_id)
+        _log_planned_changes(
+            chat_id, final_tg_ids, db_delete_ids, db_update_records, archive_target_id
+        )
         return
 
     await _archive_and_delete_messages(app, chat_id, conn, final_tg_ids, archive_target_id)
@@ -4114,8 +4129,12 @@ async def handle_database_changes(
 
 
 async def process_single_chat(
-    app: Client, chat_id: ChatID, me_id: int, args: Namespace,
-    run_ts: str | None = None, archive_target_id: ChatID | None = None,
+    app: Client,
+    chat_id: ChatID,
+    me_id: int,
+    args: Namespace,
+    run_ts: str | None = None,
+    archive_target_id: ChatID | None = None,
 ) -> None:
     """Полный цикл обработки одного чата (синхронизация, отчеты, удаление дубликатов)."""
     if not await can_process_chat(app, chat_id, me_id, args):
@@ -4156,7 +4175,6 @@ async def process_single_chat(
 # todo поддержка музыки из профиля (отдельная таблица)
 async def main() -> None:
     """Главная управляющая функция."""
-
     args = parse_arguments()
 
     # Экспорты
@@ -4183,7 +4201,6 @@ async def main() -> None:
             return
 
     async with async_ipc_lock(LOCK_FILE, timeout=LOCK_TIMEOUT):
-
         if not await check_disk_space():
             log.critical("Работа скрипта прервана из-за недостатка свободного места.")
             return
@@ -4201,13 +4218,12 @@ async def main() -> None:
                 async with app:
                     await repair_database(app)
             except Exception as e:
-                log.critical(
-                    f"Произошла критическая ошибка в режиме ремонта: {e}", exc_info=True
-                )
+                log.critical(f"Произошла критическая ошибка в режиме ремонта: {e}", exc_info=True)
             return
 
-        log.debug(f"\n{'='*20}")
-        if DRY_RUN: log.warning("Скрипт запущен в режиме симуляции (dry_run = True).")
+        log.debug(f"\n{'=' * 20}")
+        if DRY_RUN:
+            log.warning("Скрипт запущен в режиме симуляции (dry_run = True).")
         pretty = ", ".join(f"{n} ~{t:.0%}" if t else n for n, t in KEEP_PRIORITY)
         log.info(f"Стратегия выбора оригинала: {pretty}")
 
@@ -4218,15 +4234,12 @@ async def main() -> None:
             return
 
         async with app:
-
             me = app.me
 
             if args.command == "download":
                 resolved_ids = await resolve_chat_identifiers(app, [args.chat])
                 if not resolved_ids:
-                    log.error(
-                        f"Не удалось найти чат по идентификатору: {args.chat}"
-                    )
+                    log.error(f"Не удалось найти чат по идентификатору: {args.chat}")
                     return
 
                 target_chat_id = resolved_ids[0]
@@ -4269,7 +4282,11 @@ async def main() -> None:
 
             for chat_id in resolved_chat_list:
                 await process_single_chat(
-                    app, chat_id, me.id, args, run_ts=run_ts,
+                    app,
+                    chat_id,
+                    me.id,
+                    args,
+                    run_ts=run_ts,
                     archive_target_id=archive_target_id,
                 )
 
@@ -4277,15 +4294,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    log.info(f"\n\n{("=+" * 60 + "\n") * 2}")
+    log.info(f"\n\n{('=+' * 60 + '\n') * 2}")
     if sys.platform in ("win32", "cygwin"):
         try:
-            import winloop  # noqa
+            import winloop
 
             winloop.install()
-            log.debug(
-                f"winloop установлен как основной цикл событий (Platform: {sys.platform})."
-            )
+            log.debug(f"winloop установлен как основной цикл событий (Platform: {sys.platform}).")
         except ImportError:
             log.warning(
                 "winloop не найден. Рекомендуется 'pip install winloop' для ускорения на Windows."
@@ -4294,16 +4309,12 @@ if __name__ == "__main__":
     else:
         # Linux, macOS, BSD, и др.
         try:
-            import uvloop  # noqa
+            import uvloop
 
             uvloop.install()
-            log.debug(
-                f"uvloop установлен как основной цикл событий (Platform: {sys.platform})."
-            )
+            log.debug(f"uvloop установлен как основной цикл событий (Platform: {sys.platform}).")
         except ImportError:
-            log.warning(
-                "uvloop не найден. Рекомендуется 'pip install uvloop' для ускорения."
-            )
+            log.warning("uvloop не найден. Рекомендуется 'pip install uvloop' для ускорения.")
             log.debug("Используется стандартный цикл событий asyncio.")
     try:
         with secure_umask(0o077):

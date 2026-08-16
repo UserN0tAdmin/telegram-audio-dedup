@@ -1,0 +1,25 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/W — pycodestyle, F — pyflakes, I — сортировка импортов, UP — pyupgrade,
+# B — bugbear, C4 — comprehensions, SIM — simplify, RUF — ruff-специфичные,
+# D — pydocstyle (Google-конвенция, см. ниже)
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF", "D"]
+# Длинные SQL-строки и лог-сообщения не рвём — форматировщик их всё равно не переносит.
+# RUF001-003 («неоднозначные юникод-символы») — ложные срабатывания на кириллице,
+# кавычках « » и длинном тире в русскоязычных строках/докстрингах/комментариях.
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Эти модули унифицируем отдельно (не в этой итерации)
+"config.py" = ["D", "I001", "W292"]
+"logger.py" = ["D", "I001", "W292"]
+"tcp_padded.py" = ["D", "UP006", "UP007", "UP035", "UP045"]
+
+[tool.ruff.format]
+quote-style = "double"
