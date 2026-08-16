@@ -16,7 +16,7 @@ import time
 from argparse import Namespace
 from collections import Counter, defaultdict, deque
 from collections.abc import AsyncGenerator, Callable, Generator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -881,9 +881,11 @@ async def _archive_backup_file(backup_path: Path) -> None:
 
 def _compress_file_sync(source_path: Path, dest_path: Path, preset: int) -> None:
     """(СИНХРОННАЯ!) Вспомогательная функция для сжатия файла с заданным пресетом."""
-    with open(source_path, "rb") as f_in:
-        with lzma.open(dest_path, "wb", preset=preset, check=lzma.CHECK_CRC64) as f_out:
-            shutil.copyfileobj(f_in, f_out, length=1024 * 1024)  # type: ignore [arg-type]
+    with (
+        open(source_path, "rb") as f_in,
+        lzma.open(dest_path, "wb", preset=preset, check=lzma.CHECK_CRC64) as f_out,
+    ):
+        shutil.copyfileobj(f_in, f_out, length=1024 * 1024)  # type: ignore [arg-type]
 
 
 # endregion
@@ -994,10 +996,10 @@ async def validate_database() -> bool:
             # file_name IS NULL сам по себе валиден (у аудио есть performer/title);
             # сломанной считаем запись без всех трёх текстовых полей сразу
             async with conn.execute("""
-                SELECT COUNT(*) FROM audios 
-                WHERE file_unique_id IS NULL OR file_unique_id = '' 
+                SELECT COUNT(*) FROM audios
+                WHERE file_unique_id IS NULL OR file_unique_id = ''
                    OR (file_name IS NULL AND performer IS NULL AND title IS NULL)
-                   OR file_size IS NULL OR file_size < 0 
+                   OR file_size IS NULL OR file_size < 0
                    OR duration IS NULL OR duration < 0
             """) as cur:
                 broken_count = (await cur.fetchone())[0]
@@ -1065,10 +1067,10 @@ async def repair_database(app: Client) -> None:
 
         # file_name IS NULL сам по себе валиден; ищем записи без всех трёх текстовых полей
         query = """
-            SELECT chat_id, message_id FROM audios 
-            WHERE file_unique_id IS NULL OR file_unique_id = '' 
+            SELECT chat_id, message_id FROM audios
+            WHERE file_unique_id IS NULL OR file_unique_id = ''
                OR (file_name IS NULL AND performer IS NULL AND title IS NULL)
-               OR file_size IS NULL OR file_size < 0 
+               OR file_size IS NULL OR file_size < 0
                OR duration IS NULL OR duration < 0
         """
         async with conn.execute(query) as cursor:
@@ -1626,10 +1628,8 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
             except Exception as e:
                 if final_path and final_path.exists():
-                    try:
+                    with suppress(OSError):
                         os.remove(final_path)
-                    except OSError:
-                        pass
 
                 _clear_line()
                 log.error(f"Ошибка загрузки {safe_name}: {e}")
@@ -1879,10 +1879,8 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
     except Exception as e:
         log.critical(f"Критическая ошибка при экспорте Excel: {e}", exc_info=True)
         if Path(output_file).exists():
-            try:
+            with suppress(OSError):
                 os.remove(output_file)
-            except OSError:
-                pass
 
 
 async def create_duplicates_report(
@@ -2241,7 +2239,9 @@ async def populate_ignore_list(app: Client) -> None:
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     errors = [
-        (name, r) for (name, _), r in zip(usernames_to_resolve, results) if isinstance(r, Exception)
+        (name, r)
+        for (name, _), r in zip(usernames_to_resolve, results, strict=True)
+        if isinstance(r, Exception)
     ]
     if errors:
         log.critical(
@@ -2251,7 +2251,7 @@ async def populate_ignore_list(app: Client) -> None:
             log.critical(f" ID/Name '{username}' выдало: {exc}")
         raise IgnoreListResolutionError(f"Ошибок проверки имен: {len(errors)}")
 
-    for (_, apply), chat_id in zip(usernames_to_resolve, results):
+    for (_, apply), chat_id in zip(usernames_to_resolve, results, strict=True):
         apply(chat_id)
 
     log.info(f"Успешно обработано {len(results)} юзернеймов.")
@@ -2413,7 +2413,7 @@ async def sync_messages(
 
     total_added = 0
 
-    search_kwargs: dict = {}
+    search_kwargs: dict[str, Any] = {}
     is_incremental = is_fully_synced and db_newest_id > 0
 
     if is_incremental:
@@ -2540,8 +2540,8 @@ async def find_and_process_duplicates(
         app,
         chat_id,
         conn,
-        sorted(list(tg_ids)),
-        sorted(list(db_ids)),
+        sorted(tg_ids),
+        sorted(db_ids),
         update_records,
         archive_target_id=archive_target_id,
     )
@@ -3463,21 +3463,21 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
     stats_skipped_connected = 0
     all_match_scores: list[float] = []
 
-    match_kwargs = dict(
-        ids=ids,
-        names=names,
-        names_processed=names_processed,
-        metas_processed=metas_processed,
-        numbers_cache=numbers_cache,
-        meta_numbers_cache=meta_numbers_cache,
-        fuzz_scorer=fuzz_scorer,
-        w_name=W_NAME,
-        w_dur=W_DUR,
-        w_size=W_SIZE,
-        name_power=NAME_PWR,
-        adjacency=adjacency,
-        edge_meta=edge_meta,
-    )
+    match_kwargs = {
+        "ids": ids,
+        "names": names,
+        "names_processed": names_processed,
+        "metas_processed": metas_processed,
+        "numbers_cache": numbers_cache,
+        "meta_numbers_cache": meta_numbers_cache,
+        "fuzz_scorer": fuzz_scorer,
+        "w_name": W_NAME,
+        "w_dur": W_DUR,
+        "w_size": W_SIZE,
+        "name_power": NAME_PWR,
+        "adjacency": adjacency,
+        "edge_meta": edge_meta,
+    }
 
     for i in range(count):
         window_end = window_ends[i]
@@ -3530,13 +3530,13 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
         if abs_indices.size == 0:
             continue
 
-        shared = dict(
-            abs_indices=abs_indices,
-            valid_indices_relative=valid_indices_relative,
-            dynamic_thresholds=dynamic_thresholds,
-            scores_dur=scores_dur,
-            scores_size=scores_size,
-        )
+        shared = {
+            "abs_indices": abs_indices,
+            "valid_indices_relative": valid_indices_relative,
+            "dynamic_thresholds": dynamic_thresholds,
+            "scores_dur": scores_dur,
+            "scores_size": scores_size,
+        }
 
         c, m, scores = _match_batch(i, **shared, **match_kwargs)
         all_match_scores.extend(scores)
@@ -3949,12 +3949,11 @@ async def _archive_chunk(
     """
     try:
         if ARCHIVE_MODE == "copy":
-            archived = 0
             for msg_id in chunk:
                 await app.copy_message(
                     chat_id=archive_target_id, from_chat_id=chat_id, message_id=msg_id
                 )
-                archived += 1
+            archived = len(chunk)
         else:
             result = await app.forward_messages(
                 chat_id=archive_target_id,
