@@ -3,7 +3,7 @@
 import asyncio
 from argparse import Namespace
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,26 +20,12 @@ from pyrogram.errors import (
     UserNotParticipant,
 )
 
-from .config import (
-    API_HASH,
-    API_ID,
-    ARCHIVE_HIDE_SENDER,
-    ARCHIVE_MODE,
-    ARCHIVE_TARGET,
-    DRY_RUN,
-    PROXY_URL,
-    RAW_IGNORE_LIST,
-    RAW_IGNORE_REGEX,
-    REPORT_ONLY,
-    SESSION_NAME,
-    SLEEP_THRESHOLD,
-    VERIFY_CONCURRENCY,
-)
+from .context import get_settings
 from .errors import IgnoreListResolutionError
 from .logger import log
 from .state import GLOBAL_IGNORE_REGEX, IGNORE_MESSAGES, IGNORE_REGEX, chat_label, remember_chat
 from .tcp_padded import TCPPadded
-from .typedefs import AudioMeta, ChatID
+from .typedefs import AudioMeta, ChatID, MessageID
 
 # Самый большой блок, содержащий всю "умную" часть скрипта: получение сообщений из Telegram, их анализ, поиск дубликатов и выполнение действий.
 
@@ -51,21 +37,22 @@ async def create_telegram_client() -> Client | None:
         Настроенный клиент или ``None`` при критической ошибке конфигурации
         (например, кривой прокси).
     """
+    p = get_settings().pyrogram
     client_kwargs: dict[str, Any] = {
-        "api_id": API_ID,
-        "api_hash": API_HASH,
+        "api_id": p.api_id,
+        "api_hash": p.api_hash,
         "no_updates": True,
         "max_concurrent_transmissions": 10,
-        "sleep_threshold": SLEEP_THRESHOLD,
+        "sleep_threshold": p.sleep_threshold,
         # "protocol_factory": TCPPadded, # todo в конфиг вынести
     }
 
-    if PROXY_URL:
-        if is_mtproto_link(PROXY_URL):
+    if p.proxy_url:
+        if is_mtproto_link(p.proxy_url):
             try:
-                local_port = await start_local_bridge(PROXY_URL)
+                local_port = await start_local_bridge(p.proxy_url)
                 transport = (
-                    TCPPadded if needs_padded_transport(PROXY_URL) else TCPAbridged
+                    TCPPadded if needs_padded_transport(p.proxy_url) else TCPAbridged
                 )  # todo TCPIntermediatePadded
                 client_kwargs["proxy"] = {
                     "scheme": "socks5",
@@ -76,14 +63,14 @@ async def create_telegram_client() -> Client | None:
 
                 log.info(
                     f"MTProto-прокси из конфига поднят как локальный мост: "
-                    f"127.0.0.1:{local_port} -> {PROXY_URL.split('server=')[-1].split('&')[0]}"
+                    f"127.0.0.1:{local_port} -> {p.proxy_url.split('server=')[-1].split('&')[0]}"
                 )
             except Exception as e:
                 log.critical(f"Не удалось поднять локальный мост для MTProto-прокси. Ошибка: {e}")
                 return None
         else:
             try:
-                parsed_proxy = urlparse(PROXY_URL)
+                parsed_proxy = urlparse(p.proxy_url)
                 proxy_dict = {
                     "scheme": parsed_proxy.scheme,
                     "hostname": parsed_proxy.hostname,
@@ -102,12 +89,12 @@ async def create_telegram_client() -> Client | None:
                 )
                 return None
 
-    return Client(SESSION_NAME, **client_kwargs)
+    return Client(p.session_name, **client_kwargs)
 
 
 async def resolve_chat_identifiers(
     app: Client,
-    identifiers: list[str],
+    identifiers: Sequence[str],
     banner: str | None = "Преобразую идентификаторы чатов в числовые ID...",
 ) -> list[ChatID]:
     """Преобразует список идентификаторов чатов в уникальные числовые ID.
@@ -139,7 +126,7 @@ async def resolve_chat_identifiers(
         else:
             log.debug(f"Пропущен дубликат во входящем списке: '{clean}'")
 
-    semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
+    semaphore = asyncio.Semaphore(get_settings().performance.verify_concurrency)
 
     # 2. Резолв одного идентификатора: число -> само, имя -> API (или None)
     async def resolve_one(ident: str) -> ChatID | None:
@@ -211,10 +198,11 @@ async def resolve_and_validate_archive_target(app: Client, me_id: int) -> ChatID
     Returns:
         ID архивного чата или ``None``, если цель недоступна/нет прав.
     """
-    log.info(f"\n{'=' * 20}\nПроверяю архивную цель '{ARCHIVE_TARGET}'...")
-    resolved = await resolve_chat_identifiers(app, [ARCHIVE_TARGET], banner=None)
+    cfg = get_settings().archive
+    log.info(f"\n{'=' * 20}\nПроверяю архивную цель '{cfg.archive_target}'...")
+    resolved = await resolve_chat_identifiers(app, [cfg.archive_target], banner=None)
     if not resolved:
-        log.error(f"Не удалось разрешить archive_target='{ARCHIVE_TARGET}'.")
+        log.error(f"Не удалось разрешить archive_target='{cfg.archive_target}'.")
         return None
     target_id = resolved[0]
 
@@ -222,7 +210,7 @@ async def resolve_and_validate_archive_target(app: Client, me_id: int) -> ChatID
         chat = await app.get_chat(target_id)
         remember_chat(chat)
     except Exception as e:
-        log.error(f"Архивный чат '{ARCHIVE_TARGET}' ({target_id}) недоступен: {e}")
+        log.error(f"Архивный чат '{cfg.archive_target}' ({target_id}) недоступен: {e}")
         return None
 
     if target_id == me_id:
@@ -245,7 +233,7 @@ async def resolve_and_validate_archive_target(app: Client, me_id: int) -> ChatID
             return None
 
     log.info(
-        f"Архивная цель валидна: {target_id} (режим: {ARCHIVE_MODE}, hide_sender={ARCHIVE_HIDE_SENDER})."
+        f"Архивная цель валидна: {target_id} (режим: {cfg.archive_mode}, hide_sender={cfg.archive_hide_sender})."
     )
     return target_id
 
@@ -263,7 +251,8 @@ async def populate_ignore_list(app: Client) -> None:
         IgnoreListResolutionError: Если какой-либо идентификатор из списков
             исключений не удалось проверить через API.
     """
-    if not RAW_IGNORE_LIST and not RAW_IGNORE_REGEX:
+    ignore_cfg = get_settings().ignore
+    if not ignore_cfg.raw_ignore_list and not ignore_cfg.raw_ignore_regex:
         return
 
     log.info(f"\n{'=' * 20}\nОбработка списков исключений (ignore_list / ignore_regex)...")
@@ -277,10 +266,10 @@ async def populate_ignore_list(app: Client) -> None:
         except ValueError:
             usernames_to_resolve.append((key, apply))
 
-    for key, msg_ids in RAW_IGNORE_LIST.items():
+    for key, msg_ids in ignore_cfg.raw_ignore_list.items():
         _dispatch(key, lambda cid, ids=msg_ids: IGNORE_MESSAGES[cid].update(ids))
 
-    for key, patterns in RAW_IGNORE_REGEX.items():
+    for key, patterns in ignore_cfg.raw_ignore_regex.items():
         if key == "*":
             GLOBAL_IGNORE_REGEX.extend(patterns)
             continue
@@ -291,7 +280,7 @@ async def populate_ignore_list(app: Client) -> None:
         return
 
     log.info(f"Проверяю {len(usernames_to_resolve)} имен/ссылок...")
-    semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
+    semaphore = asyncio.Semaphore(get_settings().performance.verify_concurrency)
 
     async def resolve_task(identifier: str):
         """Резолвит один юзернейм ignore-списка в числовой ID."""
@@ -345,7 +334,8 @@ async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Names
             return False
 
         # 1. Определяем режим работы
-        is_read_only = args.command in ("report", "download") or DRY_RUN or REPORT_ONLY
+        core = get_settings().core
+        is_read_only = args.command in ("report", "download") or core.dry_run or core.report_only
 
         # 2. Личный чат — всегда разрешено
         if chat.type == ChatType.PRIVATE:
@@ -384,7 +374,7 @@ async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Names
         return False
 
 
-def _get_audio_attributes(message: types.Message | None) -> AudioMeta | None:
+def get_audio_attributes(message: types.Message | None) -> AudioMeta | None:
     """Проверяет, является ли сообщение аудио или аудио-документом.
 
     Args:
@@ -421,3 +411,21 @@ def _get_audio_attributes(message: types.Message | None) -> AudioMeta | None:
         )
 
     return None
+
+
+async def fetch_audio_meta_chunk(
+    app: Client, chat_id: ChatID, message_ids: list[MessageID]
+) -> list[AudioMeta | None]:
+    """Загружает сообщения из Telegram и извлекает аудио-атрибуты.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID чата.
+        message_ids: Список message_id для загрузки.
+
+    Returns:
+        Список ``AudioMeta`` (или ``None`` для не-аудио/пустых сообщений),
+        выровненный по ``message_ids``.
+    """
+    messages = await app.get_messages(chat_id, message_ids)
+    return [get_audio_attributes(m) for m in messages]

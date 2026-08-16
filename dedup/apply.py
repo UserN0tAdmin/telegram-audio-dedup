@@ -7,18 +7,10 @@ import re
 import aiosqlite
 from pyrogram import Client, types
 
-from .config import (
-    ABORT_DELETE_ON_ARCHIVE_FAILURE,
-    ARCHIVE_BEFORE_DELETE,
-    ARCHIVE_HIDE_SENDER,
-    ARCHIVE_MODE,
-    BATCH_DELETE_SIZE,
-    DRY_RUN,
-    REVOKE_PRIVATE_CHATS,
-)
+from .context import get_settings
 from .logger import log
 from .state import GLOBAL_IGNORE_REGEX, IGNORE_MESSAGES, IGNORE_REGEX, chat_label, remember_chat
-from .tg import _get_audio_attributes
+from .tg import get_audio_attributes
 from .typedefs import ChatID, MessageID
 
 
@@ -118,9 +110,10 @@ def _log_planned_changes(
     """
     log.info("РЕЖИМ СИМУЛЯЦИИ АКТИВЕН. Никаких реальных изменений не будет.")
     if tg_ids:
-        if ARCHIVE_BEFORE_DELETE and archive_target_id is not None:
+        archive_cfg = get_settings().archive
+        if archive_cfg.archive_before_delete and archive_target_id is not None:
             log.info(
-                f"Планируется {ARCHIVE_MODE} {len(tg_ids)} сообщений из чата {chat_label(chat_id)} "
+                f"Планируется {archive_cfg.archive_mode} {len(tg_ids)} сообщений из чата {chat_label(chat_id)} "
                 f"в архив {archive_target_id} перед удалением."
             )
         log.info(
@@ -133,7 +126,7 @@ def _log_planned_changes(
     if db_update_records:
         update_info = []
         for msg in db_update_records:
-            attrs = _get_audio_attributes(msg)
+            attrs = get_audio_attributes(msg)
             name = attrs.file_name if attrs else "<not-audio>"
             update_info.append(f"{msg.id} -> '{name}'")
         log.info(
@@ -185,7 +178,7 @@ async def _archive_chunk(
         ``True``, только если ВЕСЬ батч успешно заархивирован.
     """
     try:
-        if ARCHIVE_MODE == "copy":
+        if get_settings().archive.archive_mode == "copy":
             for msg_id in chunk:
                 await app.copy_message(
                     chat_id=archive_target_id, from_chat_id=chat_id, message_id=msg_id
@@ -196,7 +189,7 @@ async def _archive_chunk(
                 chat_id=archive_target_id,
                 from_chat_id=chat_id,
                 message_ids=chunk,
-                hide_sender_name=ARCHIVE_HIDE_SENDER,
+                hide_sender_name=get_settings().archive.archive_hide_sender,
             )
             archived = len(result) if isinstance(result, list) else 1
     except Exception as e:
@@ -235,10 +228,11 @@ async def _archive_and_delete_messages(
     if not tg_ids:
         return
 
-    archive_enabled = ARCHIVE_BEFORE_DELETE and archive_target_id is not None
+    cfg = get_settings()
+    archive_enabled = cfg.archive.archive_before_delete and archive_target_id is not None
     if archive_enabled and archive_target_id == chat_id:
         log.error(f"Архивная цель совпадает с чатом {chat_label(chat_id)} — архивация невозможна.")
-        if ABORT_DELETE_ON_ARCHIVE_FAILURE:
+        if cfg.archive.abort_delete_on_archive_failure:
             log.error("Удаление в этом чате пропущено во избежание потери данных.")
             return
         archive_enabled = False
@@ -251,7 +245,7 @@ async def _archive_and_delete_messages(
     if archive_enabled:
         await _send_archive_header(app, archive_target_id, chat_id, len(tg_ids))
 
-    batches = list(itertools.batched(tg_ids, BATCH_DELETE_SIZE))
+    batches = list(itertools.batched(tg_ids, cfg.performance.batch_delete_size))
     total = len(batches)
 
     for i, chunk_tuple in enumerate(batches):
@@ -261,12 +255,14 @@ async def _archive_and_delete_messages(
 
         if archive_enabled:
             ok = await _archive_chunk(app, chat_id, archive_target_id, chunk)
-            if not ok and ABORT_DELETE_ON_ARCHIVE_FAILURE:
+            if not ok and cfg.archive.abort_delete_on_archive_failure:
                 log.error(f"Батч {batch_num}/{total} не заархивирован — удаление пропущено.")
                 continue
 
         try:
-            deleted = await app.delete_messages(chat_id, chunk, revoke=REVOKE_PRIVATE_CHATS)
+            deleted = await app.delete_messages(
+                chat_id, chunk, revoke=cfg.core.revoke_private_chats
+            )
             deleted_count = deleted if isinstance(deleted, int) else len(chunk)
 
             if deleted_count != len(chunk):
@@ -333,7 +329,7 @@ async def _apply_db_updates(
     )
     update_data = []
     for r in db_update_records:
-        attrs = _get_audio_attributes(r)
+        attrs = get_audio_attributes(r)
         if attrs:
             update_data.append((*attrs, r.chat.id, r.id))
     await conn.executemany(
@@ -374,7 +370,7 @@ async def handle_database_changes(
 
     final_tg_ids = await _filter_ignored_ids(conn, chat_id, tg_ids)
 
-    if DRY_RUN:
+    if get_settings().core.dry_run:
         _log_planned_changes(
             chat_id, final_tg_ids, db_delete_ids, db_update_records, archive_target_id
         )

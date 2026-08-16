@@ -12,12 +12,12 @@ from pathlib import Path
 
 from pyrogram import Client
 
-from .config import DOWNLOADS_DIR
+from .context import get_settings
 from .db import create_connection
 from .logger import log
 from .state import chat_label
 from .typedefs import ChatID
-from .utils import _format_bytes, _get_size_safely, _sanitize_filename
+from .utils import format_bytes, get_size_safely, sanitize_filename
 
 
 def _download_matches_existing(final_path: Path, expected_size: int, expected_mtime: float) -> bool:
@@ -32,7 +32,7 @@ def _download_matches_existing(final_path: Path, expected_size: int, expected_mt
     Returns:
         ``True``, если размер и дата совпадают с ожидаемыми.
     """
-    existing_size = _get_size_safely(final_path)
+    existing_size = get_size_safely(final_path)
     try:
         existing_mtime = final_path.stat().st_mtime
     except OSError:
@@ -122,7 +122,7 @@ async def _download_worker(
         try:
             # --- 1. Подготовка имени файла ---
             base_name = file_name if file_name else f"audio_{message.id}"
-            safe_name = _sanitize_filename(base_name)
+            safe_name = sanitize_filename(base_name)
 
             # Если расширения нет, пытаемся угадать по mime-type
             if not Path(safe_name).suffix:
@@ -162,7 +162,7 @@ async def _download_worker(
             else:
                 active[safe_name] = 0
                 if not is_tty:
-                    log.info(f"Начало загрузки: {safe_name} ({_format_bytes(expected_size)})")
+                    log.info(f"Начало загрузки: {safe_name} ({format_bytes(expected_size)})")
                 else:
                     _render_download_status(is_tty, active, concurrency)
 
@@ -216,7 +216,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
     """
     log.info(f"Запуск режима СКАЧИВАНИЯ для чата {chat_label(chat_id)}...")
 
-    download_dir = Path(DOWNLOADS_DIR) / str(chat_id)
+    download_dir = Path(get_settings().paths.downloads_dir) / str(chat_id)
     download_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Папка для сохранения: {download_dir.resolve()}")
 
@@ -245,8 +245,8 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
     log.info(f"Статистика для скачивания (Чат {chat_label(chat_id)}):")
     log.info(f"  - Файлов в БД: {total_files}")
-    log.info(f"  - Общий размер: {_format_bytes(total_expected_bytes)} (без учета уже скачанных)")
-    log.info(f"  - Свободно на диске: {_format_bytes(free_bytes)}")
+    log.info(f"  - Общий размер: {format_bytes(total_expected_bytes)} (без учета уже скачанных)")
+    log.info(f"  - Свободно на диске: {format_bytes(free_bytes)}")
 
     if free_bytes < total_expected_bytes:
         log.warning("Свободного места на диске меньше, чем суммарный размер файлов!")

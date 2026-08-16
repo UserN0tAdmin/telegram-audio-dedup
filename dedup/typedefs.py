@@ -12,7 +12,7 @@ type MessageID = int
 type FileUniqueID = str
 
 
-# Структура, которую возвращает _get_audio_attributes
+# Структура, которую возвращает get_audio_attributes
 class AudioMeta(NamedTuple):
     """Атрибуты аудиосообщения (порядок полей = порядок колонок audios в БД).
 
@@ -73,7 +73,7 @@ class EdgeInfo(NamedTuple):
 type EdgeMeta = dict[EdgeKey, EdgeInfo]
 
 
-def _edge_key(a: MessageID, b: MessageID) -> EdgeKey:
+def edge_key(a: MessageID, b: MessageID) -> EdgeKey:
     """Канонический (неориентированный) ключ ребра.
 
     Args:

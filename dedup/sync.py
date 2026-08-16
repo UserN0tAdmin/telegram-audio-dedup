@@ -7,10 +7,10 @@ import aiosqlite
 from pyrogram import Client
 from pyrogram.enums import MessagesFilter
 
-from .config import SYNC_BATCH_SIZE
+from .context import get_settings
 from .logger import log
 from .state import chat_label
-from .tg import _get_audio_attributes
+from .tg import get_audio_attributes
 from .typedefs import ChatID
 
 
@@ -140,12 +140,12 @@ async def sync_messages(
                 if message.id > max_id_found:
                     max_id_found = message.id
 
-                audio_attrs = _get_audio_attributes(message)
+                audio_attrs = get_audio_attributes(message)
                 if audio_attrs:
                     batch.append((message.chat.id, message.id, *audio_attrs))
 
                 # --- батч заполнен → коммитим ---
-                if len(batch) >= SYNC_BATCH_SIZE:
+                if len(batch) >= get_settings().performance.sync_batch_size:
                     added = await _flush_audio_batch(conn, batch)
                     filter_added += added
                     total_added += added

@@ -10,11 +10,8 @@ from pathlib import Path
 
 import fasteners
 
-from .config import SESSION_NAME
 from .errors import AlreadyRunningError
 from .logger import log
-
-LOCK_FILE = Path(f"{SESSION_NAME}.lock")
 
 
 @asynccontextmanager
@@ -65,7 +62,7 @@ def secure_umask(mask: int = 0o077) -> Generator[None, None, None]:
         log.debug("Восстановлена исходная системная umask.")
 
 
-def _format_bytes(size_bytes: int | float) -> str:
+def format_bytes(size_bytes: int | float) -> str:
     """Форматирует байты в человекочитаемый вид (B, KiB, MiB, GiB, TiB).
 
     Args:
@@ -82,7 +79,7 @@ def _format_bytes(size_bytes: int | float) -> str:
     return f"{size_bytes:.2f} TiB"
 
 
-def _format_duration(seconds: int | None) -> str:
+def format_duration(seconds: int | None) -> str:
     """Форматирует секунды в mm:ss (или h:mm:ss для длинных файлов).
 
     Args:
@@ -105,7 +102,7 @@ def _format_duration(seconds: int | None) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _sanitize_filename(filename: str) -> str:
+def sanitize_filename(filename: str) -> str:
     """Очищает имя файла от запрещённых системных символов.
 
     Сохраняет читаемость, пробелы и unicode (кириллицу, эмодзи). Защищает
@@ -153,7 +150,7 @@ def _sanitize_filename(filename: str) -> str:
     return cleaned or "unnamed_file"
 
 
-def _calculate_file_hash_sync(file_path: Path) -> str:
+def calculate_file_hash_sync(file_path: Path) -> str:
     """(СИНХРОННАЯ!) Вычисляет хэш-сумму BLAKE2b файла.
 
     Args:
@@ -166,7 +163,7 @@ def _calculate_file_hash_sync(file_path: Path) -> str:
         return hashlib.file_digest(f, "blake2b").hexdigest()
 
 
-def _get_existing_parent(path: Path) -> Path:
+def get_existing_parent(path: Path) -> Path:
     """Итеративно находит первый существующий родительский каталог.
 
     Args:
@@ -181,7 +178,7 @@ def _get_existing_parent(path: Path) -> Path:
     return current
 
 
-def _get_size_safely(path: Path) -> int:
+def get_size_safely(path: Path) -> int:
     """Возвращает размер обычного файла.
 
     Args:

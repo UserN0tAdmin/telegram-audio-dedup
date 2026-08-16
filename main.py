@@ -1,6 +1,6 @@
 """Поиск и удаление дубликатов аудиофайлов в Telegram-чатах.
 
-Точка входа приложения: разбор аргументов, инициализация окружения и
+Точка входа приложения: загрузка конфигурации, инициализация окружения и
 оркестрация полного прогона дедупликации либо подкоманд CLI (``repair``,
 ``report``, ``download``, ``export``). Прикладная логика вынесена в модули
 проекта; здесь только порядок её вызова.
@@ -11,26 +11,19 @@ import datetime
 import sys
 from argparse import Namespace
 from collections.abc import Callable
+from functools import partial
 from typing import Any, Final
 
 from pyrogram import Client
 
 from dedup.backups import create_database_backup
 from dedup.cli import parse_arguments
-from dedup.config import (
-    ARCHIVE_BEFORE_DELETE,
-    BACKUP_ON_STARTUP,
-    CHAT_LIST,
-    DRY_RUN,
-    KEEP_PRIORITY,
-    LOCK_TIMEOUT,
-    REPORT_ONLY,
-)
+from dedup.context import get_settings, set_settings
 from dedup.db import create_connection, initialize_database, repair_database, validate_database
 from dedup.disk import check_disk_space
 from dedup.downloads import download_chat_audio
 from dedup.duplicates import find_and_process_duplicates
-from dedup.errors import AlreadyRunningError, IgnoreListResolutionError
+from dedup.errors import AlreadyRunningError, ConfigError, IgnoreListResolutionError
 from dedup.exports import (
     export_cleaned_meta_to_csv,
     export_cleaned_names_to_csv,
@@ -38,19 +31,21 @@ from dedup.exports import (
     export_filenames_to_txt,
     export_filenames_with_url_to_txt,
 )
-from dedup.logger import log
+from dedup.logger import log, setup_logger
 from dedup.reports import create_duplicates_report
+from dedup.settings import load_config
 from dedup.state import chat_label
 from dedup.sync import sync_messages
 from dedup.tg import (
     can_process_chat,
     create_telegram_client,
+    fetch_audio_meta_chunk,
     populate_ignore_list,
     resolve_and_validate_archive_target,
     resolve_chat_identifiers,
 )
 from dedup.typedefs import ChatID
-from dedup.utils import LOCK_FILE, async_ipc_lock, secure_umask
+from dedup.utils import async_ipc_lock, secure_umask
 
 # Главная управляющая логика: process_single_chat и main выступают "дирижёрами" —
 # вызывают функции из других модулей в правильном порядке.
@@ -86,7 +81,7 @@ async def process_single_chat(
         async with create_connection() as conn:
             await sync_messages(app, chat_id, conn)
 
-            if args.command == "report" or REPORT_ONLY:
+            if args.command == "report" or get_settings().core.report_only:
                 await create_duplicates_report(chat_id, conn, ts=run_ts)
                 return
 
@@ -116,6 +111,7 @@ async def process_single_chat(
 async def main() -> None:
     """Главная управляющая функция."""
     args = parse_arguments()
+    settings = get_settings()
 
     # Экспорты: подкоманда -> (функция, финальное сообщение)
     export_actions: Final[dict[str, tuple[Callable[[ChatID], Any], str]]] = {
@@ -141,12 +137,12 @@ async def main() -> None:
         log.info(f"{done_message} Выход.")
         return
 
-    async with async_ipc_lock(LOCK_FILE, timeout=LOCK_TIMEOUT):
+    async with async_ipc_lock(settings.lock_file, timeout=settings.safety.lock_timeout):
         if not await check_disk_space():
             log.critical("Работа скрипта прервана из-за недостатка свободного места.")
             return
 
-        if args.command != "repair" and BACKUP_ON_STARTUP:
+        if args.command != "repair" and settings.backup.backup_on_startup:
             await create_database_backup()
 
         app = await create_telegram_client()
@@ -157,15 +153,15 @@ async def main() -> None:
             log.info("=" * 15 + "ЗАПУСК В РЕЖИМЕ РЕМОНТА БД" + "=" * 15)
             try:
                 async with app:
-                    await repair_database(app)
+                    await repair_database(partial(fetch_audio_meta_chunk, app))
             except Exception as e:
                 log.critical(f"Произошла критическая ошибка в режиме ремонта: {e}", exc_info=True)
             return
 
         log.debug(f"\n{'=' * 20}")
-        if DRY_RUN:
+        if settings.core.dry_run:
             log.warning("Скрипт запущен в режиме симуляции (dry_run = True).")
-        pretty = ", ".join(f"{n} ~{t:.0%}" if t else n for n, t in KEEP_PRIORITY)
+        pretty = ", ".join(f"{n} ~{t:.0%}" if t else n for n, t in settings.core.keep_priority)
         log.info(f"Стратегия выбора оригинала: {pretty}")
 
         await initialize_database()
@@ -195,7 +191,7 @@ async def main() -> None:
                 log.info("Работа завершена. Выход.")
                 return
 
-            resolved_chat_list = await resolve_chat_identifiers(app, CHAT_LIST)
+            resolved_chat_list = await resolve_chat_identifiers(app, settings.core.chat_list)
 
             try:
                 await populate_ignore_list(app)
@@ -203,9 +199,11 @@ async def main() -> None:
                 return
 
             archive_target_id: ChatID | None = None
-            if ARCHIVE_BEFORE_DELETE and not (args.command == "report" or REPORT_ONLY):
+            if settings.archive.archive_before_delete and not (
+                args.command == "report" or settings.core.report_only
+            ):
                 archive_target_id = await resolve_and_validate_archive_target(app, me.id)
-                if archive_target_id is None and not DRY_RUN:
+                if archive_target_id is None and not settings.core.dry_run:
                     log.critical(
                         "Архивация включена, но целевой чат недоступен. "
                         "Останавливаюсь, чтобы не удалять без резервной копии."
@@ -234,8 +232,8 @@ async def main() -> None:
     log.info("Работа скрипта завершена.")
 
 
-if __name__ == "__main__":
-    log.info(f"\n\n{('=+' * 60 + '\n') * 2}")
+def _install_event_loop() -> None:
+    """Устанавливает быстрый цикл событий под текущую платформу."""
     if sys.platform in ("win32", "cygwin"):
         try:
             import winloop
@@ -257,11 +255,33 @@ if __name__ == "__main__":
         except ImportError:
             log.warning("uvloop не найден. Рекомендуется 'pip install uvloop' для ускорения.")
             log.debug("Используется стандартный цикл событий asyncio.")
+
+
+def _bootstrap() -> None:
+    """Синхронная точка входа: конфигурация, логирование, запуск прогона."""
     try:
-        with secure_umask(0o077):
+        settings = load_config()
+    except ConfigError as e:
+        print(f"ОШИБКА КОНФИГУРАЦИИ: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    with secure_umask(0o077):
+        set_settings(settings)
+        setup_logger(settings)
+        for warning in settings.startup_warnings:
+            log.warning(warning)
+
+        log.info(f"\n\n{('=+' * 60 + '\n') * 2}")
+        _install_event_loop()
+
+        try:
             asyncio.run(main())
-    except AlreadyRunningError as e:
-        log.warning(str(e))
-        sys.exit(1)
-    except Exception as e:
-        log.critical(f"Критическая ошибка при выполнении скрипта: {e}", exc_info=True)
+        except AlreadyRunningError as e:
+            log.warning(str(e))
+            sys.exit(1)
+        except Exception as e:
+            log.critical(f"Критическая ошибка при выполнении скрипта: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    _bootstrap()

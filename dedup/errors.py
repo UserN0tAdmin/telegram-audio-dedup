@@ -11,3 +11,9 @@ class IgnoreListResolutionError(Exception):
     """Исключение, выбрасываемое, если не удалось разрешить идентификаторы из ignore_list."""
 
     pass
+
+
+class ConfigError(RuntimeError):
+    """Исключение, выбрасываемое при некорректной конфигурации приложения."""
+
+    pass

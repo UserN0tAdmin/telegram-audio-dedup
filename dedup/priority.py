@@ -3,8 +3,9 @@
 from collections.abc import Callable
 from typing import Final, NamedTuple
 
-from .config import _KEEP_CRITERIA_VALID, KEEP_PRIORITY
-from .fuzzy import _clean_filename
+from .context import get_settings
+from .fuzzy import clean_filename
+from .settings import KEEP_CRITERIA_VALID
 from .typedefs import DBRow, DuplicateGroup
 
 
@@ -63,16 +64,14 @@ def _extract_has_meta(r: DBRow) -> float:
     score = 0.0
     if _meta_field_ok(r["performer"]):
         score += 1.0
-    if _meta_field_ok(r["title"]) and _clean_filename(r["title"]) != _clean_filename(
-        r["file_name"]
-    ):
+    if _meta_field_ok(r["title"]) and clean_filename(r["title"]) != clean_filename(r["file_name"]):
         score += 1.0
     return score
 
 
 def _extract_clean_name_len(r: DBRow) -> float | None:
     """Длина очищенного имени файла или ``None`` для пустого имени."""
-    cleaned = _clean_filename(r["file_name"])
+    cleaned = clean_filename(r["file_name"])
     return float(len(cleaned)) if cleaned else None
 
 
@@ -88,8 +87,8 @@ _KEEP_CRITERIA: Final[dict[str, KeepCriterion]] = {
 }
 
 # Ловим рассинхрон реестра и валидации конфига на импорте, а не в рантайме
-assert set(_KEEP_CRITERIA) == _KEEP_CRITERIA_VALID, (
-    "Реестр критериев main.py разошёлся с _KEEP_CRITERIA_VALID в config.py"
+assert set(_KEEP_CRITERIA) == KEEP_CRITERIA_VALID, (
+    "Реестр критериев priority.py разошёлся с KEEP_CRITERIA_VALID в config.py"
 )
 
 
@@ -108,7 +107,7 @@ def _cascade_winner(pool: list[DBRow]) -> DBRow:
         Запись-победитель каскада.
     """
     cands = pool
-    for name, tol in KEEP_PRIORITY:
+    for name, tol in get_settings().core.keep_priority:
         if len(cands) == 1:
             break
         crit = _KEEP_CRITERIA[name]
@@ -123,7 +122,7 @@ def _cascade_winner(pool: list[DBRow]) -> DBRow:
     return cands[0]
 
 
-def _order_group_by_keep_priority(group: DuplicateGroup) -> list[DBRow]:
+def order_group_by_keep_priority(group: DuplicateGroup) -> list[DBRow]:
     """Полный порядок приоритета: [оригинал, fallback #1, fallback #2, ...].
 
     Порядок нужен целиком: если лучший кандидат не пройдёт верификацию

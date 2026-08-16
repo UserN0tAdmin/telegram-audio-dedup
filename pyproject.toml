@@ -1,3 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dedup"
+version = "24.0.0"
+description = "Поиск и удаление дубликатов аудиофайлов в Telegram-чатах"
+authors = [{ name = "UserN0tAdmin" }]
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "fasteners>=0.20",
+    "kurigram>=2.2.24",
+    "python-dotenv>=1.2.2",
+    "numpy>=2.5.2",
+    "openpyxl>=3.1.5",
+    "pysocks>=1.7.1",
+    "rapidfuzz>=3.14.5",
+    "tgcrypto-pyrofork>=1.2.8",
+    "wcwidth>=0.8.2",
+    "mtproxy-bridge @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git",
+    "uvloop>=0.22.1 ; sys_platform != 'win32'",
+    "winloop>=0.5.0 ; sys_platform == 'win32'",
+]
+
+# Инструменты разработки; установка: pip install --group dev (pip >= 25.1)
+# либо pip install -r requirements-dev.txt
+[dependency-groups]
+dev = [
+    "ruff>=0.15.20",
+    "black>=26.5.1",
+    "mypy>=2.3.0",
+    "py-spy>=0.4.2",
+]
+
+# main.py остаётся точкой входа репозитория (python main.py) и в пакет не ставится
+[tool.setuptools]
+packages = ["dedup"]
+py-modules = []
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -16,9 +57,6 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003"]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-# Эти модули унифицируем отдельно (не в этой итерации)
-"dedup/config.py" = ["D", "I001", "W292"]
-"dedup/logger.py" = ["D", "I001", "W292"]
 "dedup/tcp_padded.py" = ["D", "UP006", "UP007", "UP035", "UP045"]
 
 [tool.ruff.format]

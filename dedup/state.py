@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from pyrogram import types
 
-from .config import CHAT_LABEL_PARTS, SESSION_NAME
+from .context import get_settings
 from .logger import log
 from .typedefs import ChatID
 
@@ -42,14 +42,18 @@ def remember_chat(chat: types.Chat) -> None:
 def _username_from_session(chat_id: int) -> str | None:
     """Юзернейм из файла сессии (только чтение).
 
+    Кэш не учитывает ``session_name``: тестам, меняющим конфигурацию,
+    нужно вызывать ``_username_from_session.cache_clear()``.
+
     Args:
         chat_id: Числовой ID чата.
 
     Returns:
         Юзернейм или ``None``, если не нашли / не смогли прочитать.
     """
+    session_name = get_settings().pyrogram.session_name
     try:
-        with sqlite3.connect(f"file:{SESSION_NAME}.session?mode=ro", uri=True) as conn:
+        with sqlite3.connect(f"file:{session_name}.session?mode=ro", uri=True) as conn:
             row = conn.execute(
                 "SELECT username FROM usernames WHERE id = ? LIMIT 1", (chat_id,)
             ).fetchone()
@@ -95,7 +99,8 @@ def _id_from_session(identifier: str) -> int | None:
         return None
 
     try:
-        with sqlite3.connect(f"file:{SESSION_NAME}.session?mode=ro", uri=True) as conn:
+        session_name = get_settings().pyrogram.session_name
+        with sqlite3.connect(f"file:{session_name}.session?mode=ro", uri=True) as conn:
             row = conn.execute(
                 "SELECT id FROM usernames WHERE username = ? COLLATE NOCASE LIMIT 1",
                 (uname,),
@@ -125,7 +130,8 @@ def chat_label(chat_id: int) -> str:
         "id": str(chat_id),
     }
 
-    parts = [values[key] for key in CHAT_LABEL_PARTS if values.get(key)]
+    label_parts = get_settings().logging.chat_label_parts
+    parts = [values[key] for key in label_parts if values.get(key)]
 
     if not parts:
         return str(chat_id)
@@ -133,12 +139,10 @@ def chat_label(chat_id: int) -> str:
     if len(parts) == 1:
         return parts[0]
 
-    has_title = "title" in CHAT_LABEL_PARTS and bool(name)
+    has_title = "title" in label_parts and bool(name)
     if has_title:
         tail = [
-            values[key]
-            for key in CHAT_LABEL_PARTS
-            if key != "title" and key in values and values[key]
+            values[key] for key in label_parts if key != "title" and key in values and values[key]
         ]
         return f"{name} [{' | '.join(tail)}]" if tail else name
 

@@ -9,8 +9,8 @@ from typing import Any, Final
 
 import aiosqlite
 
-from .config import DB_FILE, EXPORTS_DIR
-from .fuzzy import _clean_filename, _clean_meta, _process_for_fuzzy
+from .context import get_settings
+from .fuzzy import clean_filename, clean_meta, process_for_fuzzy
 from .logger import log
 from .state import chat_label
 from .typedefs import ChatID, CsvRowFormatter, DBRow, RowFormatter
@@ -19,7 +19,7 @@ from .typedefs import ChatID, CsvRowFormatter, DBRow, RowFormatter
 
 
 # todo ротация?
-def _build_export_path(
+def build_export_path(
     chat_id: ChatID,
     kind: str,
     ext: str,
@@ -41,10 +41,11 @@ def _build_export_path(
     if ts is None:
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    exports_root = Path(EXPORTS_DIR)
+    cfg = get_settings()
+    exports_root = Path(cfg.paths.exports_dir)
     if chat_id == 0:
         sub = exports_root / "_full"
-        filename = f"{ts}_{kind}_of_{Path(DB_FILE).stem}.{ext}"
+        filename = f"{ts}_{kind}_of_{Path(cfg.paths.db_file).stem}.{ext}"
     else:
         sub = exports_root / str(chat_id)
         filename = f"{ts}_{kind}.{ext}"
@@ -66,12 +67,13 @@ async def _generic_export_to_txt(
     """
     log.info(f"Запущена задача экспорта для чата {chat_label(chat_id)} в файл '{output_file}'...")
 
+    db_file = get_settings().paths.db_file
     try:
-        if not Path(DB_FILE).exists():
-            log.critical(f"Файл базы данных '{DB_FILE}' не найден. Нечего экспортировать.")
+        if not Path(db_file).exists():
+            log.critical(f"Файл базы данных '{db_file}' не найден. Нечего экспортировать.")
             return
 
-        async with aiosqlite.connect(DB_FILE) as conn:
+        async with aiosqlite.connect(db_file) as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(sql_query, (chat_id,)) as cursor:
                 data_rows = await cursor.fetchall()
@@ -120,7 +122,7 @@ async def _generic_export_to_csv(
             пропускает запись.
     """
     is_full_export = chat_id == 0
-    output_file = _build_export_path(chat_id, kind, "csv")
+    output_file = build_export_path(chat_id, kind, "csv")
 
     if is_full_export:
         log.info(f"Запущена задача ПОЛНОГО экспорта '{kind}' в '{output_file}'...")
@@ -130,11 +132,12 @@ async def _generic_export_to_csv(
         )
 
     try:
-        if not Path(DB_FILE).exists():
-            log.critical(f"Файл базы данных '{DB_FILE}' не найден. Нечего экспортировать.")
+        db_file = get_settings().paths.db_file
+        if not Path(db_file).exists():
+            log.critical(f"Файл базы данных '{db_file}' не найден. Нечего экспортировать.")
             return
 
-        async with aiosqlite.connect(DB_FILE) as conn:
+        async with aiosqlite.connect(db_file) as conn:
             conn.row_factory = aiosqlite.Row
             if is_full_export:
                 query, params = sql_query_full, ()
@@ -179,7 +182,7 @@ async def export_filenames_to_txt(chat_id: ChatID) -> None:
     Args:
         chat_id: ID чата, для которого экспортировать имена.
     """
-    output_file = _build_export_path(chat_id, "filenames", "txt")
+    output_file = build_export_path(chat_id, "filenames", "txt")
 
     await _generic_export_to_txt(
         chat_id=chat_id,
@@ -229,7 +232,7 @@ async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
         # 4. Собираем строку
         return f"{file_name}{padding}| https://t.me/c/{public_chat_id}/{message_id}"
 
-    output_file = _build_export_path(chat_id, "filenames_with_urls", "txt")
+    output_file = build_export_path(chat_id, "filenames_with_urls", "txt")
 
     await _generic_export_to_txt(
         chat_id=chat_id,
@@ -242,7 +245,7 @@ async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
 async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
     """Экспортирует процесс очистки имён файлов в CSV для проверки фильтров.
 
-    Формат: Исходное имя, После ``_clean_filename``, После ``default_process``.
+    Формат: Исходное имя, После ``clean_filename``, После ``default_process``.
 
     Args:
         chat_id: ID чата; ``0`` — экспорт всей базы целиком.
@@ -252,15 +255,15 @@ async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
         orig = row["file_name"]
         if not orig:
             return None
-        cleaned = _clean_filename(orig)
-        return [orig, cleaned, _process_for_fuzzy(cleaned)]
+        cleaned = clean_filename(orig)
+        return [orig, cleaned, process_for_fuzzy(cleaned)]
 
     await _generic_export_to_csv(
         chat_id=chat_id,
         kind="cleaned_names",
         sql_query="SELECT file_name FROM audios WHERE chat_id = ? AND file_name IS NOT NULL ORDER BY file_name",
         sql_query_full="SELECT file_name FROM audios WHERE file_name IS NOT NULL ORDER BY file_name",
-        header=["Исходное имя", "После _clean_filename", "После default_process"],
+        header=["Исходное имя", "После clean_filename", "После default_process"],
         row_formatter=formatter,
     )
 
@@ -268,7 +271,7 @@ async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
 async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
     """Экспортирует процесс очистки метаданных (performer+title) в CSV.
 
-    Формат: Performer, Title, После ``_clean_meta``, После ``default_process``.
+    Формат: Performer, Title, После ``clean_meta``, После ``default_process``.
     Показывает ровно ту строку, которую видит fuzzy-матчер.
 
     Args:
@@ -276,14 +279,14 @@ async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
     """
 
     def formatter(row: DBRow) -> list[str] | None:
-        cleaned = _clean_meta(row["performer"], row["title"])
+        cleaned = clean_meta(row["performer"], row["title"])
         if not cleaned:
             return None
         return [
             row["performer"] or "",
             row["title"] or "",
             cleaned,
-            _process_for_fuzzy(cleaned),
+            process_for_fuzzy(cleaned),
         ]
 
     where = "(performer IS NOT NULL OR title IS NOT NULL)"
@@ -293,7 +296,7 @@ async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
         kind="cleaned_meta",
         sql_query=f"SELECT performer, title FROM audios WHERE chat_id = ? AND {where} {order}",
         sql_query_full=f"SELECT performer, title FROM audios WHERE {where} {order}",
-        header=["Performer", "Title", "После _clean_meta", "После default_process"],
+        header=["Performer", "Title", "После clean_meta", "После default_process"],
         row_formatter=formatter,
     )
 
@@ -323,15 +326,16 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
 
     # Определяем имя файла и режим
     is_full_export = chat_id == 0
-    output_file = _build_export_path(chat_id, "database_export", "xlsx")
+    output_file = build_export_path(chat_id, "database_export", "xlsx")
 
     if is_full_export:
         log.info(f"Запущена задача ПОЛНОГО экспорта базы данных в '{output_file}'...")
     else:
         log.info(f"Запущена задача экспорта для чата {chat_id} в '{output_file}'...")
 
-    if not Path(DB_FILE).exists():
-        log.critical(f"Файл базы данных '{DB_FILE}' не найден.")
+    db_file = get_settings().paths.db_file
+    if not Path(db_file).exists():
+        log.critical(f"Файл базы данных '{db_file}' не найден.")
         return
 
     # --- ВНУТРЕННИЕ ХЕЛПЕРЫ ---
@@ -410,7 +414,7 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
     data_found = False
 
     try:
-        async with aiosqlite.connect(DB_FILE) as conn:
+        async with aiosqlite.connect(get_settings().paths.db_file) as conn:
             async with conn.execute("SELECT name FROM sqlite_master WHERE type='table';") as cursor:
                 tables = await cursor.fetchall()
                 table_names = [row[0] for row in tables]

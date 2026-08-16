@@ -10,11 +10,13 @@ config.cfg
 *.sqlite-shm
 *.db
 *.lock
+backup/
 exports/
 log/
 downloads/
 
 # Python
+dedup.egg-info/
 __pycache__/
 *.pyc
 .venv/

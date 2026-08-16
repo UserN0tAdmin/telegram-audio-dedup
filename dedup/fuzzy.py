@@ -11,22 +11,9 @@ import numpy as np
 from rapidfuzz import fuzz, process
 from rapidfuzz.utils import default_process
 
-from .config import (
-    DURATION_POWER,
-    FUZZY_MATCHING_MODE,
-    FUZZY_THRESHOLD,
-    MAX_DURATION_DIFF_SEC,
-    NAME_POWER,
-    PENALTY_NUMBERS_MISMATCH,
-    SIZE_POWER,
-    USE_JACCARD_PENALTY,
-    USE_META_FUZZY,
-    WEIGHT_DURATION,
-    WEIGHT_NAME,
-    WEIGHT_SIZE,
-)
+from .context import get_settings
 from .logger import log
-from .typedefs import DBRow, DuplicateGroup, EdgeInfo, EdgeMeta, _edge_key
+from .typedefs import DBRow, DuplicateGroup, EdgeInfo, EdgeMeta, edge_key
 
 # todo Вынести regex в конфиг
 # region --- Регулярки ---
@@ -58,7 +45,7 @@ _RE_META_PLACEHOLDER = re.compile(
 # region --- Подфункции fuzzy-матчера ---
 
 
-def _clean_filename(fname: str | None) -> str:
+def clean_filename(fname: str | None) -> str:
     """Нормализует имя файла для fuzzy-сравнения.
 
     Удаляет медиа-расширения, рекламные вставки в скобках, сайтовые
@@ -100,11 +87,11 @@ def _clean_filename(fname: str | None) -> str:
     return cleaned
 
 
-def _process_for_fuzzy(cleaned_name: str) -> str:
+def process_for_fuzzy(cleaned_name: str) -> str:
     """``default_process`` + схлопывание пробелов — финальная форма для fuzzy.
 
     Args:
-        cleaned_name: Строка после ``_clean_filename``/``_clean_meta``.
+        cleaned_name: Строка после ``clean_filename``/``clean_meta``.
 
     Returns:
         Нормализованная строка для передачи в RapidFuzz.
@@ -122,7 +109,7 @@ _SRC_LABEL = {
 }
 
 
-def _clean_meta(performer: str | None, title: str | None) -> str:
+def clean_meta(performer: str | None, title: str | None) -> str:
     """``performer+title``, очищенные тем же пайплайном, что и имя файла.
 
     Единая нормализация важнее точечной: имя и мета должны сравниваться
@@ -139,10 +126,10 @@ def _clean_meta(performer: str | None, title: str | None) -> str:
     parts = [p for p in (performer, title) if p and not _RE_META_PLACEHOLDER.match(p)]
     if not parts:
         return ""
-    return _clean_filename(" ".join(parts))
+    return clean_filename(" ".join(parts))
 
 
-def _src_suffix(src: int | None) -> str:
+def src_suffix(src: int | None) -> str:
     """Подпись источника для отчёта, напр. ``'(мета-мета)'``.
 
     Args:
@@ -186,14 +173,14 @@ def _prepare_arrays(
     durations = np.array([r["duration"] or 0 for r in sorted_rows], dtype=np.int32)
     sizes = np.array([r["file_size"] or 0 for r in sorted_rows], dtype=np.float64)
 
-    names = [_clean_filename(r["file_name"]) for r in sorted_rows]
-    names_processed = [_process_for_fuzzy(n) for n in names]
+    names = [clean_filename(r["file_name"]) for r in sorted_rows]
+    names_processed = [process_for_fuzzy(n) for n in names]
 
-    if USE_META_FUZZY:
-        metas = [_clean_meta(r["performer"], r["title"]) for r in sorted_rows]
+    if get_settings().fuzzy.use_meta_fuzzy:
+        metas = [clean_meta(r["performer"], r["title"]) for r in sorted_rows]
     else:
         metas = [""] * len(sorted_rows)  # фича выключена -> мета пустая всюду
-    metas_processed = [_process_for_fuzzy(m) for m in metas]
+    metas_processed = [process_for_fuzzy(m) for m in metas]
 
     name_lengths = np.array([len(n) for n in names_processed], dtype=np.int32)
     numbers_cache = [{int(x) for x in _RE_DIGITS.findall(n)} for n in names]
@@ -251,7 +238,7 @@ def _uid_prepass(
             id_a, id_b = int(ids[a]), int(ids[b])
             adjacency[id_a].add(id_b)
             adjacency[id_b].add(id_a)
-            edge_meta[_edge_key(id_a, id_b)] = EdgeInfo(
+            edge_meta[edge_key(id_a, id_b)] = EdgeInfo(
                 reason="uid", score=1.0, name=None, dur=None, size=None, penalty=0.0
             )
             stats_uid_matches += 1
@@ -413,11 +400,12 @@ def _compute_penalty(
     """
     if current_numbers == candidate_numbers:
         return 0.0
-    if USE_JACCARD_PENALTY and (current_numbers or candidate_numbers):
+    cfg = get_settings().fuzzy
+    if cfg.use_jaccard_penalty and (current_numbers or candidate_numbers):
         union = len(current_numbers | candidate_numbers)
         intersection = len(current_numbers & candidate_numbers)
-        return PENALTY_NUMBERS_MISMATCH * (1.0 - intersection / union) if union else 0.0
-    return PENALTY_NUMBERS_MISMATCH
+        return cfg.penalty_numbers_mismatch * (1.0 - intersection / union) if union else 0.0
+    return cfg.penalty_numbers_mismatch
 
 
 def _filter_already_connected(
@@ -661,7 +649,7 @@ def _match_batch(
         id_j = int(ids[abs_idx])
         adjacency[id_i].add(id_j)
         adjacency[id_j].add(id_i)
-        edge_meta[_edge_key(id_i, id_j)] = EdgeInfo(
+        edge_meta[edge_key(id_i, id_j)] = EdgeInfo(
             reason="fuzzy",
             score=float(final_scores[k]),
             name=float(fuzzy_scores[k]),
@@ -786,7 +774,7 @@ def _log_stats(
             f"median={np.median(arr):.3f}, "
             f"p75={np.percentile(arr, 75):.3f}, "
             f"max={arr.max():.3f} "
-            f"(порог={FUZZY_THRESHOLD:.3f})"
+            f"(порог={get_settings().fuzzy.threshold:.3f})"
         )
     if stats_comparisons > 0:
         duplicate_rate = stats_matches / stats_comparisons * 100
@@ -798,7 +786,7 @@ def _log_stats(
 # region --- Оркестратор fuzzy-поиска ---
 
 
-def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[DuplicateGroup], EdgeMeta]:
+def group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[DuplicateGroup], EdgeMeta]:
     """Находит группы дубликатов аудиофайлов через fuzzy matching.
 
     Использует sliding window по отсортированным длительностям + NumPy
@@ -839,14 +827,15 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
         id_to_row,
     ) = _prepare_arrays(sorted_rows)
 
-    # Локальные алиасы конфиг-констант для горячего цикла; NAME_POWER и
-    # SIZE_POWER используются напрямую из конфига (алиас совпал бы с именем).
-    BASE_THRESHOLD = FUZZY_THRESHOLD
-    MAX_DIFF = MAX_DURATION_DIFF_SEC
-    W_NAME = WEIGHT_NAME
-    W_DUR = WEIGHT_DURATION
-    W_SIZE = WEIGHT_SIZE
-    DUR_POWER = DURATION_POWER
+    # Локальные алиасы настроек для горячего цикла; name_power и size_power
+    # передаются напрямую (алиас совпал бы с именем поля).
+    cfg = get_settings().fuzzy
+    BASE_THRESHOLD = cfg.threshold
+    MAX_DIFF = cfg.max_duration_diff_sec
+    W_NAME = cfg.weight_name
+    W_DUR = cfg.weight_duration
+    W_SIZE = cfg.weight_size
+    DUR_POWER = cfg.duration_power
 
     window_ends = np.searchsorted(durations, durations + MAX_DIFF, side="right")
     max_window_size = max(1, int(np.max(window_ends - np.arange(count) - 1)))
@@ -854,7 +843,7 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
     buf_scores_dur = np.empty(max_window_size, dtype=np.float64)
     buf_scores_size = np.empty(max_window_size, dtype=np.float64)
 
-    if FUZZY_MATCHING_MODE == "set":
+    if cfg.matching_mode == "set":
         fuzz_scorer = fuzz.token_set_ratio
         log.info("Режим Fuzzy: SET (Агрессивный, ищет пересечения слов)")
     else:
@@ -886,7 +875,7 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
         "w_name": W_NAME,
         "w_dur": W_DUR,
         "w_size": W_SIZE,
-        "name_power": NAME_POWER,
+        "name_power": cfg.name_power,
         "adjacency": adjacency,
         "edge_meta": edge_meta,
     }
@@ -908,7 +897,7 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
             W_DUR,
             W_SIZE,
             DUR_POWER,
-            SIZE_POWER,
+            cfg.size_power,
         )
 
         candidates_mask = _optimistic_filter(
@@ -921,9 +910,9 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
             W_NAME,
             W_DUR,
             W_SIZE,
-            NAME_POWER,
-            FUZZY_MATCHING_MODE,
-            USE_META_FUZZY,
+            cfg.name_power,
+            cfg.matching_mode,
+            cfg.use_meta_fuzzy,
         )
         if not np.any(candidates_mask):
             continue

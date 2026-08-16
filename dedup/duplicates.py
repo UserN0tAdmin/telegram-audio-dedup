@@ -8,12 +8,12 @@ import aiosqlite
 from pyrogram import Client
 
 from .apply import handle_database_changes
-from .config import ENABLE_FUZZY_MATCHING, VERIFY_CHUNK_SIZE, VERIFY_CONCURRENCY
-from .fuzzy import _group_audios_fuzzy_optimized
+from .context import get_settings
+from .fuzzy import group_audios_fuzzy_optimized
 from .logger import log
-from .priority import _order_group_by_keep_priority
+from .priority import order_group_by_keep_priority
 from .state import chat_label
-from .tg import _get_audio_attributes
+from .tg import get_audio_attributes
 from .typedefs import (
     ChatID,
     ClassificationResult,
@@ -23,7 +23,7 @@ from .typedefs import (
     EdgeMeta,
     MessageID,
     VerifiedMessagesDict,
-    _edge_key,
+    edge_key,
 )
 
 
@@ -47,7 +47,7 @@ async def find_and_process_duplicates(
     log.info(f"\n{'=' * 10}\nНачинаю анализ дубликатов в чате {chat_label(chat_id)}...")
 
     # Шаг 1: Найти группы потенциальных дубликатов в локальной базе данных
-    potential_groups, _ = await _get_potential_duplicate_groups(chat_id, conn)
+    potential_groups, _ = await get_potential_duplicate_groups(chat_id, conn)
     if not potential_groups:
         log.info(f"В чате {chat_label(chat_id)} дубликатов не найдено.")
         return
@@ -143,7 +143,7 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
             ):
                 if neighbor_id == curr_id:
                     continue
-                key = _edge_key(curr_id, neighbor_id)
+                key = edge_key(curr_id, neighbor_id)
                 # uid имеет приоритет над meta при описании причины
                 if reason == "uid" or key not in edge_meta:
                     edge_meta[key] = EdgeInfo(
@@ -166,7 +166,7 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
     return potential_duplicate_groups, edge_meta
 
 
-async def _get_potential_duplicate_groups(
+async def get_potential_duplicate_groups(
     chat_id: ChatID, conn: aiosqlite.Connection
 ) -> tuple[list[DuplicateGroup], EdgeMeta]:
     """Запрашивает из БД все аудио чата и передаёт их группировщику.
@@ -192,8 +192,8 @@ async def _get_potential_duplicate_groups(
         log.info(f"В базе данных нет записей для анализа в чате {chat_label(chat_id)}.")
         return [], {}
 
-    if ENABLE_FUZZY_MATCHING:
-        return await asyncio.to_thread(_group_audios_fuzzy_optimized, all_audios)
+    if get_settings().fuzzy.enable:
+        return await asyncio.to_thread(group_audios_fuzzy_optimized, all_audios)
         # return []
     else:
         return await asyncio.to_thread(_group_audios_by_duplicates, all_audios)
@@ -215,7 +215,8 @@ async def _verify_messages_from_api(
         Словарь ``message_id -> Message | None | Exception``.
     """
     verified_messages = {}
-    semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
+    cfg = get_settings().performance
+    semaphore = asyncio.Semaphore(cfg.verify_concurrency)
 
     async def fetch_chunk(chunk_ids):
         """Загружает один чанк сообщений; при ошибке возвращает её."""
@@ -226,7 +227,9 @@ async def _verify_messages_from_api(
                 log.error(f"Ошибка при получении пакета сообщений (ID: {chunk_ids[0]}...): {e}.")
                 return e
 
-    original_chunks = [list(chunk) for chunk in itertools.batched(ids_to_verify, VERIFY_CHUNK_SIZE)]
+    original_chunks = [
+        list(chunk) for chunk in itertools.batched(ids_to_verify, cfg.verify_chunk_size)
+    ]
     tasks = [fetch_chunk(chunk) for chunk in original_chunks]
     results_from_gather = await asyncio.gather(*tasks)
 
@@ -263,7 +266,7 @@ def _classify_verified_duplicates(
     to_update_in_db = []
 
     for group in duplicate_groups:
-        sorted_group = _order_group_by_keep_priority(group)
+        sorted_group = order_group_by_keep_priority(group)
 
         found_a_valid_original = False
         group_is_safe_to_process = True
@@ -297,7 +300,7 @@ def _classify_verified_duplicates(
                 log.debug(f"Сообщение {msg_id} не найдено в Telegram. Будет удалено из БД.")
                 to_delete_from_db.add(msg_id)
             else:
-                api_audio_attrs = _get_audio_attributes(api_result)
+                api_audio_attrs = get_audio_attributes(api_result)
                 if api_audio_attrs:
                     # Проверка на изменение контента
                     if (

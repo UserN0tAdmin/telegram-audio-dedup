@@ -3,16 +3,15 @@
 import asyncio
 import itertools
 from collections import defaultdict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import aiosqlite
-from pyrogram import Client
 
-from .config import DB_CACHE_SIZE, DB_FILE, VERIFY_CHUNK_SIZE, VERIFY_CONCURRENCY
+from .context import get_settings
 from .logger import log
 from .state import chat_label
-from .tg import _get_audio_attributes
+from .typedefs import AudioMeta, ChatID, MessageID
 
 # Этот блок отвечает за все прямое взаимодействие с файлом SQLite: инициализация, подключение, валидация, ремонт и простые запросы (получение ID).
 
@@ -25,7 +24,7 @@ async def initialize_database() -> None:
     включается WAL-режим и создаются индексы для поиска дубликатов.
     """
     log.debug("Инициализация схемы базы данных...")
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with aiosqlite.connect(get_settings().paths.db_file) as conn:
         async with conn.execute("PRAGMA journal_mode = WAL;") as cursor:
             row = await cursor.fetchone()
         applied_mode = row[0] if row else None
@@ -75,13 +74,14 @@ async def create_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
     """
     log.debug("Создание нового оптимизированного соединения с БД...")
 
-    async with aiosqlite.connect(DB_FILE) as conn:
+    cfg = get_settings()
+    async with aiosqlite.connect(cfg.paths.db_file) as conn:
         conn.row_factory = aiosqlite.Row
 
         pragmas = {
             "synchronous": "NORMAL",
             "temp_store": "MEMORY",
-            "cache_size": DB_CACHE_SIZE,
+            "cache_size": cfg.performance.db_cache_size,
             # рассмотреть: "mmap_size", "page_size", "wal_autocheckpoint" и т.д.
         }
 
@@ -109,7 +109,7 @@ async def validate_database() -> bool:
     warnings = 0
 
     try:
-        async with aiosqlite.connect(DB_FILE) as conn:
+        async with aiosqlite.connect(get_settings().paths.db_file) as conn:
             conn.row_factory = aiosqlite.Row
 
             # --- 1. Физическая целостность (CRITICAL) ---
@@ -184,20 +184,25 @@ async def validate_database() -> bool:
     return True
 
 
-async def repair_database(app: Client) -> None:
+async def repair_database(
+    fetch_audio_meta: Callable[[ChatID, list[MessageID]], Awaitable[list[AudioMeta | None]]],
+) -> None:
     """Выполняет умное восстановление и очистку базы данных.
 
-    Пытается восстановить повреждённые записи, используя данные из Telegram,
-    сбрасывает некорректные курсоры синхронизации, пересоздаёт индексы
-    и выполняет VACUUM.
+    Пытается восстановить повреждённые записи, сверяя их с источником данных
+    через ``fetch_audio_meta``, сбрасывает некорректные курсоры
+    синхронизации, пересоздаёт индексы и выполняет VACUUM.
 
     Args:
-        app: Клиент Telegram для сверки записей с сервером.
+        fetch_audio_meta: Асинхронная функция сверки: для списка ``message_id``
+            возвращает выровненный по индексам список ``AudioMeta``
+            (или ``None``, если сообщение больше не аудио).
     """
     log.info("=" * 15 + "ЗАПУСК РЕМОНТА БД" + "=" * 15)
+    cfg = get_settings()
 
     # --- ЧАСТЬ 1: Работа с данными (Исправление и Очистка) ---
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with aiosqlite.connect(cfg.paths.db_file) as conn:
         conn.row_factory = aiosqlite.Row
 
         async with conn.execute("PRAGMA integrity_check;") as cur:
@@ -232,17 +237,16 @@ async def repair_database(app: Client) -> None:
 
             records_to_update = []
             ids_to_delete = []
-            semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
+            semaphore = asyncio.Semaphore(cfg.performance.verify_concurrency)
 
             async def fetch_and_process_chunk(chat_id, chunk_ids):
-                """Сверяет один чанк message_id с Telegram и раскладывает результат."""
+                """Сверяет один чанк message_id с источником и раскладывает результат."""
                 async with semaphore:
                     try:
-                        messages = await app.get_messages(chat_id, chunk_ids)
-                        for original_id, msg in zip(chunk_ids, messages, strict=True):
-                            attrs = _get_audio_attributes(msg)
-                            if attrs:
-                                records_to_update.append((*attrs, chat_id, original_id))
+                        metas = await fetch_audio_meta(chat_id, chunk_ids)
+                        for original_id, meta in zip(chunk_ids, metas, strict=True):
+                            if meta:
+                                records_to_update.append((*meta, chat_id, original_id))
                             else:
                                 ids_to_delete.append((chat_id, original_id))
                     except Exception as e:
@@ -252,7 +256,7 @@ async def repair_database(app: Client) -> None:
 
             tasks = []
             for chat_id, msg_ids in records_by_chat.items():
-                for chunk_tuple in itertools.batched(msg_ids, VERIFY_CHUNK_SIZE):
+                for chunk_tuple in itertools.batched(msg_ids, cfg.performance.verify_chunk_size):
                     tasks.append(fetch_and_process_chunk(chat_id, list(chunk_tuple)))
 
             if tasks:
@@ -295,7 +299,7 @@ async def repair_database(app: Client) -> None:
     # --- ЧАСТЬ 2: Оптимизация (VACUUM) на новом соединении ---
     log.info("\nЭтап 3: Оптимизация файла БД (VACUUM)...")
     try:
-        async with aiosqlite.connect(DB_FILE, isolation_level=None) as conn:
+        async with aiosqlite.connect(cfg.paths.db_file, isolation_level=None) as conn:
             log.info("  -> Выполнение wal_checkpoint(TRUNCATE)...")
             async with conn.execute("PRAGMA wal_checkpoint(TRUNCATE);") as cursor:
                 await cursor.fetchall()
