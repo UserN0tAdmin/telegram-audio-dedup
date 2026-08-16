@@ -1,4 +1,4 @@
-"""Тесты load_config: полный разбор, накопление ошибок, env-приоритет, keep_priority."""
+"""Тесты load_config: полный разбор, накопление ошибок, env/CLI-приоритет, keep_priority."""
 
 import configparser
 
@@ -163,6 +163,17 @@ def test_env_overrides_api_credentials(isolated_env, monkeypatch):
     assert settings.startup_warnings == ()
 
 
+def test_cli_overrides_beat_env_for_api_credentials(isolated_env, monkeypatch):
+    monkeypatch.setenv("TG_API_ID", "999")
+    monkeypatch.setenv("TG_API_HASH", "env-hash")
+    settings = load_config(
+        write_config(isolated_env),
+        cli_overrides={("pyrogram", "api_id"): "42", ("pyrogram", "api_hash"): "cli-hash"},
+    )
+    assert settings.pyrogram.api_id == 42
+    assert settings.pyrogram.api_hash == "cli-hash"
+
+
 def test_api_credentials_missing_gives_warning(isolated_env):
     settings = load_config(write_config(isolated_env))
     assert settings.pyrogram.api_id == 0
@@ -193,6 +204,98 @@ def test_fallbacks_when_config_is_minimal(isolated_env):
     assert settings.core.keep_priority == (("oldest", 0.0),)  # пустой keep_priority + легаси-выкл
     assert settings.fuzzy.threshold == pytest.approx(0.90)
     assert settings.performance.sync_batch_size == 7000
+
+
+# --- CLI-перекрытия (cli_overrides в load_config) ---
+
+
+def test_cli_overrides_beat_file(isolated_env):
+    settings = load_config(
+        write_config(isolated_env),  # dry_run = false в файле
+        cli_overrides={("core", "dry_run"): "true"},
+    )
+    assert settings.core.dry_run is True
+
+
+def test_cli_overrides_create_missing_section(isolated_env):
+    isolated_env.write_text("[core]\nchat_list =\n", encoding="utf-8")
+    settings = load_config(isolated_env, cli_overrides={("archive", "archive_mode"): "copy"})
+    assert settings.archive.archive_mode == "copy"
+
+
+def test_cli_overrides_parsed_like_ini_values(isolated_env):
+    settings = load_config(
+        write_config(isolated_env),
+        cli_overrides={
+            ("core", "chat_list"): "@new_chat",
+            ("core", "keep_priority"): "smallest ~ 2%, newest",
+            ("logging", "log_level_console"): "DEBUG",
+        },
+    )
+    assert settings.core.chat_list == ("@new_chat",)
+    assert settings.core.keep_priority == (("smallest", 0.02), ("newest", 0.0))
+    assert settings.logging.log_level_console == "DEBUG"
+
+
+def test_cli_overrides_clamped_and_validated_as_from_file(isolated_env):
+    path = write_config(isolated_env)
+    settings = load_config(path, cli_overrides={("performance", "batch_delete_size"): "500"})
+    assert settings.performance.batch_delete_size == 100  # кламп 1..100
+
+    with pytest.raises(ConfigError, match="Сумма весов"):  # как из файла
+        load_config(path, cli_overrides={("fuzzy_matching", "weight_name"): "0.9"})
+
+
+def test_cli_overrides_ignore_sections_accept_any_key(isolated_env):
+    settings = load_config(
+        write_config(isolated_env),
+        cli_overrides={("ignore_list", "-1001234567890"): "4973, 4660"},
+    )
+    assert settings.ignore.raw_ignore_list == {"-1001234567890": {4973, 4660}}
+
+
+def test_cli_overrides_recorded_with_old_value(isolated_env):
+    settings = load_config(
+        write_config(isolated_env),
+        cli_overrides={("core", "dry_run"): "true", ("core", "report_only"): "true"},
+    )
+    assert settings.applied_overrides == (
+        ("core", "dry_run", "false", "true"),
+        ("core", "report_only", "false", "true"),
+    )
+
+
+def test_no_cli_overrides_leaves_settings_untouched(isolated_env):
+    settings = load_config(write_config(isolated_env))
+    assert settings.applied_overrides == ()
+
+
+def test_cli_overrides_unknown_section_rejected(isolated_env):
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(
+            write_config(isolated_env),
+            cli_overrides={("coor", "dry_run"): "true"},
+        )
+    assert "неизвестная секция 'coor'" in str(excinfo.value)
+    assert "core" in str(excinfo.value)  # список допустимых прилагается
+
+
+def test_cli_overrides_unknown_option_rejected(isolated_env):
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(
+            write_config(isolated_env),
+            cli_overrides={("core", "dry_runn"): "true"},
+        )
+    assert "неизвестная опция 'core.dry_runn'" in str(excinfo.value)
+    assert "dry_run" in str(excinfo.value)  # список допустимых прилагается
+
+
+def test_cli_override_option_names_case_insensitive(isolated_env):
+    settings = load_config(
+        write_config(isolated_env),
+        cli_overrides={("core", "DRY_RUN"): "true"},
+    )
+    assert settings.core.dry_run is True
 
 
 # --- Юнит-тесты приватного _parse_keep_priority ---

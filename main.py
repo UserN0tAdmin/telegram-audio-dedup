@@ -17,7 +17,7 @@ from typing import Any, Final
 from pyrogram import Client
 
 from dedup.backups import create_database_backup
-from dedup.cli import parse_arguments
+from dedup.cli import collect_cli_overrides, parse_arguments
 from dedup.context import get_settings, set_settings
 from dedup.db import create_connection, initialize_database, repair_database, validate_database
 from dedup.disk import check_disk_space
@@ -109,9 +109,13 @@ async def process_single_chat(
 
 # todo рефакторинг?
 # todo поддержка музыки из профиля (отдельная таблица)
-async def main() -> None:
-    """Главная управляющая функция."""
-    args = parse_arguments()
+async def main(args: Namespace) -> None:
+    """Главная управляющая функция.
+
+    Args:
+        args: Аргументы CLI, разобранные в ``_bootstrap`` (загруженная
+            конфигурация уже учитывает перекрытия из них).
+    """
     settings = get_settings()
 
     # Экспорты: подкоманда -> (функция, финальное сообщение)
@@ -263,9 +267,10 @@ def _install_event_loop() -> None:
 
 
 def _bootstrap() -> None:
-    """Синхронная точка входа: конфигурация, логирование, запуск прогона."""
+    """Синхронная точка входа: аргументы, конфигурация, логирование, запуск."""
+    args = parse_arguments()
     try:
-        settings = load_config()
+        settings = load_config(cli_overrides=collect_cli_overrides(args))
     except ConfigError as e:
         print(f"ОШИБКА КОНФИГУРАЦИИ: {e}", file=sys.stderr)
         sys.exit(2)
@@ -275,12 +280,16 @@ def _bootstrap() -> None:
         setup_logger(settings)
         for warning in settings.startup_warnings:
             log.warning(warning)
+        for section, option, old_value, new_value in settings.applied_overrides:
+            log.info(
+                f"CLI-перекрытие: {section}.{option} = {new_value} (в конфиге: {old_value or '—'})"
+            )
 
         log.info(f"\n\n{('=+' * 60 + '\n') * 2}")
         _install_event_loop()
 
         try:
-            asyncio.run(main())
+            asyncio.run(main(args))
         except AlreadyRunningError as e:
             log.warning(str(e))
             sys.exit(1)

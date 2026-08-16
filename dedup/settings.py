@@ -8,6 +8,7 @@
 import configparser
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -31,6 +32,91 @@ KEEP_CRITERIA_VALID: Final[frozenset[str]] = frozenset(
 )
 # Допуск бессмысленен для уникальных (message_id) и бинарных критериев
 _KEEP_NO_TOLERANCE: Final[frozenset[str]] = frozenset({"oldest", "newest", "best_meta"})
+
+# Реестр опций для валидации CLI-перекрытий (--set SECTION.OPTION=VALUE):
+# секция -> фиксированный набор опций; None — ключи динамические
+# ([ignore_list]/[ignore_regex]: ID чатов или '*'). Имена опций, как и в
+# самом INI, регистронезависимы; имена секций — чувствительны.
+KNOWN_OPTIONS: Final[dict[str, frozenset[str] | None]] = {
+    "core": frozenset(
+        {
+            "chat_list",
+            "dry_run",
+            "report_only",
+            "revoke_private_chats",
+            "keep_priority",
+            "keep_newest_duplicate",
+        }
+    ),
+    "pyrogram": frozenset({"api_id", "api_hash", "session_name", "proxy_url", "sleep_threshold"}),
+    "archive": frozenset(
+        {
+            "archive_before_delete",
+            "archive_target",
+            "archive_mode",
+            "archive_hide_sender",
+            "abort_delete_on_archive_failure",
+        }
+    ),
+    "fuzzy_matching": frozenset(
+        {
+            "enable",
+            "matching_mode",
+            "threshold",
+            "max_duration_diff_sec",
+            "name_power",
+            "duration_power",
+            "size_power",
+            "weight_name",
+            "weight_duration",
+            "weight_size",
+            "penalty_numbers_mismatch",
+            "use_jaccard_penalty",
+            "use_meta_fuzzy",
+        }
+    ),
+    "paths": frozenset({"backup_dir", "db_file", "downloads_dir", "exports_dir", "log_file"}),
+    "system_safety": frozenset(
+        {
+            "lock_timeout",
+            "min_free_space_mb",
+            "dynamic_space_coefficient",
+            "dynamic_space_safety_buffer_mb",
+        }
+    ),
+    "performance": frozenset(
+        {
+            "sync_batch_size",
+            "batch_delete_size",
+            "verify_chunk_size",
+            "verify_concurrency",
+            "db_cache_size",
+        }
+    ),
+    "backup": frozenset(
+        {
+            "backup_on_startup",
+            "backup_only_if_changed",
+            "rotate_before_backup",
+            "max_backups",
+            "archive_old_backups",
+            "lzma_preset",
+            "max_archives",
+        }
+    ),
+    "logging": frozenset(
+        {
+            "log_level_console",
+            "log_level_file",
+            "log_level_pyrogram",
+            "log_max_bytes",
+            "log_backup_count",
+            "chat_label_parts",
+        }
+    ),
+    "ignore_list": None,
+    "ignore_regex": None,
+}
 
 
 # --- Секции конфигурации (отражают секции config.cfg) ---
@@ -258,6 +344,8 @@ class Settings:
         logging: Секция ``[logging]``.
         lock_file: Путь lock-файла (производное от ``session_name``).
         startup_warnings: Некритические замечания конфигурации.
+        applied_overrides: Применённые CLI-перекрытия
+            ``(секция, опция, старое_значение, новое_значение)``.
     """
 
     core: CoreSettings
@@ -272,6 +360,7 @@ class Settings:
     logging: LoggingSettings
     lock_file: Path
     startup_warnings: tuple[str, ...]
+    applied_overrides: tuple[tuple[str, str, str, str], ...] = ()
 
 
 # --- Помощники чтения (работают по уже прочитанному parser'у) ---
@@ -286,18 +375,32 @@ def _get_list(
 
 
 def _get_env_or_str(
-    config: configparser.ConfigParser, section: str, key: str, env_var: str, fallback: str = ""
+    config: configparser.ConfigParser,
+    section: str,
+    key: str,
+    env_var: str,
+    fallback: str = "",
+    cli_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> str:
-    """Переменная окружения, если задана, иначе строка из конфига."""
+    """CLI-перекрытие, затем переменная окружения, иначе строка из конфига."""
+    if (section, key) in cli_keys:
+        return config.get(section, key, fallback=fallback)
     if env_val := os.getenv(env_var):
         return env_val
     return config.get(section, key, fallback=fallback)
 
 
 def _get_env_or_int(
-    config: configparser.ConfigParser, section: str, key: str, env_var: str, fallback: int = 0
+    config: configparser.ConfigParser,
+    section: str,
+    key: str,
+    env_var: str,
+    fallback: int = 0,
+    cli_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> int:
-    """Переменная окружения (int), если задана и корректна, иначе конфиг."""
+    """CLI-перекрытие, затем переменная окружения (int), иначе конфиг."""
+    if (section, key) in cli_keys:
+        return config.getint(section, key, fallback=fallback)
     if env_val := os.getenv(env_var):
         try:
             return int(env_val)
@@ -414,12 +517,65 @@ def _parse_keep_priority(
     return tuple(result)
 
 
-def load_config(path: str | Path | None = None) -> Settings:
+def _apply_cli_overrides(
+    config: configparser.ConfigParser,
+    cli_overrides: Mapping[tuple[str, str], str] | None,
+    errors: list[str],
+) -> list[tuple[str, str, str, str]]:
+    """Применяет CLI-перекрытия к parser'у до разбора секций.
+
+    Ключи проверяются против :data:`KNOWN_OPTIONS` (проблемы уходят в
+    ``errors``); значение пишется как сырая INI-строка, поэтому дальнейший
+    разбор, валидация и клампинг едины для файла и CLI.
+
+    Args:
+        config: Уже прочитанный parser ``config.cfg``.
+        cli_overrides: ``{(секция, опция): значение}`` из командной строки.
+        errors: Накопитель проблем конфигурации.
+
+    Returns:
+        Список применённых перекрытий ``(секция, опция, старое, новое)``
+        для стартового лога.
+    """
+    applied: list[tuple[str, str, str, str]] = []
+    if not cli_overrides:
+        return applied
+
+    for (section, option), value in cli_overrides.items():
+        option = config.optionxform(option)
+        if section not in KNOWN_OPTIONS:
+            errors.append(
+                f"--set: неизвестная секция '{section}'. "
+                f"Допустимые секции: {', '.join(KNOWN_OPTIONS)}"
+            )
+            continue
+        allowed = KNOWN_OPTIONS[section]
+        if allowed is not None and option not in allowed:
+            errors.append(
+                f"--set: неизвестная опция '{section}.{option}'. "
+                f"Допустимые опции [{section}]: {', '.join(sorted(allowed))}"
+            )
+            continue
+        if not config.has_section(section):
+            config.add_section(section)
+        old_value = config.get(section, option, fallback="")
+        config.set(section, option, value)
+        applied.append((section, option, old_value, value))
+    return applied
+
+
+def load_config(
+    path: str | Path | None = None,
+    cli_overrides: Mapping[tuple[str, str], str] | None = None,
+) -> Settings:
     """Читает ``.env`` и ``config.cfg``, валидирует и собирает :class:`Settings`.
 
     Args:
         path: Путь к файлу конфигурации; по умолчанию ``config.cfg``
             относительно текущего каталога.
+        cli_overrides: Перекрытия из командной строки
+            ``{(секция, опция): значение}``; применяются к файлу до разбора,
+            приоритет выше ``.env`` и ``config.cfg``.
 
     Returns:
         Полная неизменяемая конфигурация прогона.
@@ -436,6 +592,8 @@ def load_config(path: str | Path | None = None) -> Settings:
 
     errors: list[str] = []
     warnings: list[str] = []
+    applied_overrides = _apply_cli_overrides(config, cli_overrides, errors)
+    cli_keys = frozenset(cli_overrides) if cli_overrides else frozenset()
 
     # --- [core] + [ignore_list] + [ignore_regex] ---
     core = CoreSettings(
@@ -452,8 +610,12 @@ def load_config(path: str | Path | None = None) -> Settings:
 
     # --- [pyrogram] ---
     pyrogram = PyrogramSettings(
-        api_id=_get_env_or_int(config, "pyrogram", "api_id", "TG_API_ID", fallback=0),
-        api_hash=_get_env_or_str(config, "pyrogram", "api_hash", "TG_API_HASH", fallback=""),
+        api_id=_get_env_or_int(
+            config, "pyrogram", "api_id", "TG_API_ID", fallback=0, cli_keys=cli_keys
+        ),
+        api_hash=_get_env_or_str(
+            config, "pyrogram", "api_hash", "TG_API_HASH", fallback="", cli_keys=cli_keys
+        ),
         session_name=config.get("pyrogram", "session_name", fallback="my_account"),
         proxy_url=config.get("pyrogram", "proxy_url", fallback=""),
         sleep_threshold=max(1, config.getint("pyrogram", "sleep_threshold", fallback=300)),
@@ -577,4 +739,5 @@ def load_config(path: str | Path | None = None) -> Settings:
         logging=logging_cfg,
         lock_file=Path(f"{pyrogram.session_name}.lock"),
         startup_warnings=tuple(warnings),
+        applied_overrides=tuple(applied_overrides),
     )

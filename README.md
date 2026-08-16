@@ -78,8 +78,12 @@ python main.py report
 | `python main.py export xlsx [чат]` | Дамп таблиц БД в Excel |
 | `python main.py search "<запрос>"` | Нечёткий поиск (с пониманием опечаток) по всем чатам БД: топ-20 совпадений в консоль |
 
-`<чат>` — числовой ID, `@username` или ссылка `t.me`. Полное описание с
-примерами и типичными сценариями: [docs/usage.md](docs/usage.md).
+`<чат>` — числовой ID, `@username` или ссылка `t.me`. Любую опцию
+`config.cfg` можно перекрыть на один запуск аргументами: `--dry-run`,
+`--chat`, `--threshold` или универсальным
+`--set SECTION.OPTION=VALUE` (например, `python main.py --no-dry-run --chat @music`);
+справочник — [docs/configuration.md](docs/configuration.md#перекрытие-аргументами-командной-строки).
+Полное описание команд с примерами и типичными сценариями: [docs/usage.md](docs/usage.md).
 
 ## Документация
 
