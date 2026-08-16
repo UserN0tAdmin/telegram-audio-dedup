@@ -74,7 +74,7 @@ async def _generic_export_to_txt(
         async with aiosqlite.connect(db_file) as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(sql_query, (chat_id,)) as cursor:
-                data_rows = await cursor.fetchall()
+                data_rows = list(await cursor.fetchall())
 
         if not data_rows:
             log.warning(f"В базе данных не найдено записей для чата {chat_label(chat_id)}.")
@@ -142,7 +142,7 @@ async def _generic_export_to_csv(
             else:
                 query, params = sql_query, (chat_id,)
             async with conn.execute(query, params) as cursor:
-                data_rows = await cursor.fetchall()
+                data_rows = list(await cursor.fetchall())
 
         if not data_rows:
             target = "базе данных" if is_full_export else f"чате {chat_label(chat_id)}"

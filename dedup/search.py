@@ -127,7 +127,7 @@ async def run_search(
         async with aiosqlite.connect(db_file) as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute("SELECT * FROM audios") as cursor:
-                rows = await cursor.fetchall()
+                rows = list(await cursor.fetchall())
 
         if not rows:
             log.warning("База данных не содержит аудиозаписей.")

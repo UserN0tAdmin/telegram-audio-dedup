@@ -123,7 +123,8 @@ async def _perform_backup_creation(
                 result = await cursor.fetchone()
                 if not result or result[0].lower() != "ok":
                     log.critical(
-                        f"Исходная БД повреждена! integrity_check: '{result[0]}'. Бэкап отменен."
+                        f"Исходная БД повреждена! integrity_check: "
+                        f"'{result[0] if result else 'нет ответа'}'. Бэкап отменен."
                     )
                     return None
 

@@ -186,7 +186,7 @@ async def get_potential_duplicate_groups(
     # Но фактически маловероятно, что есть чаты, где аудиофайлов больше, чем 300 тыс., что максимум для 512 МБ - 1 ГБ ОЗУ
     # Т.е. здесь сделано верно
     async with conn.execute("SELECT * FROM audios WHERE chat_id = ?", (chat_id,)) as cursor:
-        all_audios = await cursor.fetchall()
+        all_audios = list(await cursor.fetchall())
 
     if not all_audios:
         log.info(f"В базе данных нет записей для анализа в чате {chat_label(chat_id)}.")

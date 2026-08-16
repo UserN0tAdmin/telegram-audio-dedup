@@ -229,7 +229,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
             (chat_id,),
         ) as cursor,
     ):
-        records = await cursor.fetchall()
+        records = list(await cursor.fetchall())
 
     if not records:
         log.warning(

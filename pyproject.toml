@@ -29,11 +29,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff>=0.15.20",
-    "black>=26.5.1",
     "mypy>=2.3.0",
     "py-spy>=0.4.2",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "types-openpyxl>=3.1.5",
 ]
 
 [tool.pytest.ini_options]
@@ -44,6 +44,21 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "livedb: интеграционные тесты на копии живой БД music_library.sqlite (скип, если файла нет)",
 ]
+
+[tool.mypy]
+python_version = "3.12"
+
+# У этих библиотек нет стабов и py.typed (winloop к тому же ставится только на Windows)
+[[tool.mypy.overrides]]
+module = [
+    "fasteners",
+    "fasteners.*",
+    "mtproxy_bridge",
+    "mtproxy_bridge.*",
+    "winloop",
+    "winloop.*",
+]
+ignore_missing_imports = true
 
 # main.py остаётся точкой входа репозитория (python main.py) и в пакет не ставится
 [tool.setuptools]

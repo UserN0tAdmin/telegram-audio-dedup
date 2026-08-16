@@ -642,8 +642,8 @@ def _match_batch(
                 f"'{names[i]}' <==> '{names[abs_idx]}'"
             )
 
-    for k in matched_positions.tolist():
-        s = int(surv_idx[k])
+    for pos in matched_positions.tolist():
+        s = int(surv_idx[pos])
         abs_idx = int(abs_indices[s])
         rel_idx = int(rel[s])
         id_j = int(ids[abs_idx])
@@ -651,12 +651,12 @@ def _match_batch(
         adjacency[id_j].add(id_i)
         edge_meta[edge_key(id_i, id_j)] = EdgeInfo(
             reason="fuzzy",
-            score=float(final_scores[k]),
-            name=float(fuzzy_scores[k]),
+            score=float(final_scores[pos]),
+            name=float(fuzzy_scores[pos]),
             dur=float(scores_dur[rel_idx]),
             size=float(scores_size[rel_idx]),
-            penalty=float(penalties[k]),
-            text_source=int(src_per_cand[k]),
+            penalty=float(penalties[pos]),
+            text_source=int(src_per_cand[pos]),
         )
 
     return comparisons, int(match_mask.sum()), matched_scores
@@ -864,7 +864,7 @@ def group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplicat
     stats_skipped_connected = 0
     all_match_scores: list[float] = []
 
-    match_kwargs = {
+    match_kwargs: dict[str, Any] = {
         "ids": ids,
         "names": names,
         "names_processed": names_processed,
@@ -931,7 +931,7 @@ def group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplicat
         if abs_indices.size == 0:
             continue
 
-        shared = {
+        shared: dict[str, Any] = {
             "abs_indices": abs_indices,
             "valid_indices_relative": valid_indices_relative,
             "dynamic_thresholds": dynamic_thresholds,

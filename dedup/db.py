@@ -116,7 +116,9 @@ async def validate_database() -> bool:
             async with conn.execute("PRAGMA integrity_check;") as cur:
                 result = await cur.fetchone()
                 if not result or result[0].lower() != "ok":
-                    log.critical(f"Файл БД физически поврежден: {result[0]}")
+                    log.critical(
+                        f"Файл БД физически поврежден: {result[0] if result else 'нет ответа'}"
+                    )
                     return False
 
             # --- 2. Наличие таблиц (CRITICAL) ---
@@ -222,7 +224,7 @@ async def repair_database(
                OR duration IS NULL OR duration < 0
         """
         async with conn.execute(query) as cursor:
-            broken_records = await cursor.fetchall()
+            broken_records = list(await cursor.fetchall())
 
         if not broken_records:
             log.info("Поврежденных записей для восстановления не найдено.")
