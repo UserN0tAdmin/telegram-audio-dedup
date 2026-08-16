@@ -1,3 +1,15 @@
+"""Поиск и удаление дубликатов аудиофайлов в Telegram-чатах.
+
+Синхронизирует метаданные аудио из указанных чатов в локальную SQLite-БД,
+ищет дубликаты (точные совпадения и fuzzy-сравнение имён/метаданных) и
+удаляет лишние сообщения из Telegram, соблюдая стратегию выбора оригинала
+из конфигурации (keep_priority).
+
+Подкоманды CLI: ``repair`` (восстановление БД), ``report`` (отчёт без
+удаления), ``download`` (скачивание аудио чата), ``export`` (экспорт данных
+в txt/csv/xlsx). Вызов без подкоманды — полный прогон дедупликации.
+"""
+
 import argparse
 import asyncio
 import datetime
@@ -115,7 +127,16 @@ type FileUniqueID = str
 
 # Структура, которую возвращает _get_audio_attributes
 class AudioMeta(NamedTuple):
-    """Атрибуты аудиосообщения (порядок полей = порядок колонок audios в БД)."""
+    """Атрибуты аудиосообщения (порядок полей = порядок колонок audios в БД).
+
+    Attributes:
+        file_unique_id: Уникальный ID файла на серверах Telegram.
+        file_name: Имя файла (``None``, если не задано).
+        file_size: Размер файла в байтах.
+        duration: Длительность в секундах (0, если неизвестна).
+        performer: Исполнитель из тегов (``None``, если не задан).
+        title: Название из тегов (``None``, если не задано).
+    """
 
     file_unique_id: FileUniqueID
     file_name: str | None
@@ -141,14 +162,15 @@ type EdgeKey = tuple[MessageID, MessageID]
 class EdgeInfo(NamedTuple):
     """Причина связи двух файлов и коэффициенты сходства.
 
-    reason  — "uid" / "meta" / "fuzzy".
-    score   — итоговый коэффициент сходства (для uid/meta = 1.0).
-    name    — вклад текстового fuzzy (имя/мета), 0..1; None для uid/meta.
-              (legacy-название поля; фактически это лучший текстовый источник)
-    dur     — вклад длительности (0..1); None для uid/meta.
-    size    — вклад размера (0..1); None для uid/meta.
-    penalty — штраф за несовпадение числовых токенов (0.0 если нет).
-    text_source — код источника fuzzy-совпадения (0..3); None для uid/meta.
+    Attributes:
+        reason: Причина связи: ``"uid"`` / ``"meta"`` / ``"fuzzy"``.
+        score: Итоговый коэффициент сходства (для uid/meta = 1.0).
+        name: Вклад текстового fuzzy (имя/мета), 0..1; ``None`` для uid/meta
+            (legacy-название поля; фактически это лучший текстовый источник).
+        dur: Вклад длительности (0..1); ``None`` для uid/meta.
+        size: Вклад размера (0..1); ``None`` для uid/meta.
+        penalty: Штраф за несовпадение числовых токенов (0.0, если нет).
+        text_source: Код источника fuzzy-совпадения (0..3); ``None`` для uid/meta.
     """
 
     reason: str
@@ -165,7 +187,15 @@ type EdgeMeta = dict[EdgeKey, EdgeInfo]
 
 
 def _edge_key(a: MessageID, b: MessageID) -> EdgeKey:
-    """Канонический (неориентированный) ключ ребра."""
+    """Канонический (неориентированный) ключ ребра.
+
+    Args:
+        a: Первый message_id.
+        b: Второй message_id.
+
+    Returns:
+        Пара ``(min(a, b), max(a, b))``.
+    """
     return (a, b) if a < b else (b, a)
 
 
@@ -175,9 +205,17 @@ type VerifiedMessagesDict = dict[MessageID, types.Message | None | Exception]
 
 # Результат классификации дубликатов
 class ClassificationResult(NamedTuple):
-    delete_from_tg: set[MessageID]  # удалить из Telegram
-    delete_from_db: set[MessageID]  # удалить только из БД (сообщения нет в ТГ)
-    update_in_db: list[types.Message]  # обновить в БД (контент изменился)
+    """Итог классификации верифицированных групп дубликатов.
+
+    Attributes:
+        delete_from_tg: message_id для удаления из Telegram.
+        delete_from_db: message_id для удаления только из БД (сообщения нет в ТГ).
+        update_in_db: Сообщения для обновления в БД (контент изменился).
+    """
+
+    delete_from_tg: set[MessageID]
+    delete_from_db: set[MessageID]
+    update_in_db: list[types.Message]
 
 
 # Алиас для функции форматирования строки при экспорте
@@ -211,6 +249,9 @@ def parse_arguments() -> argparse.Namespace:
 
     Подкоманды: ``repair``, ``report``, ``download``, ``export``.
     Вызов без подкоманды — обычный прогон дедупликации.
+
+    Returns:
+        Разобранные аргументы (`argparse.Namespace`).
     """
     parser = argparse.ArgumentParser(
         description="Скрипт для поиска и удаления дубликатов аудио в Telegram чатах."
@@ -313,14 +354,18 @@ def parse_arguments() -> argparse.Namespace:
 @asynccontextmanager
 async def async_ipc_lock(path: str | Path, timeout: float | None = 0) -> AsyncGenerator[None, None]:
     """Асинхронный контекстный менеджер для межпроцессной блокировки.
+
     Предотвращает одновременный запуск нескольких копий скрипта.
 
-    path — путь к lock-файлу (например, my_script.lock)
+    Args:
+        path: Путь к lock-файлу (например, ``my_script.lock``).
+        timeout: Поведение ожидания захвата:
+            ``0`` — не блокироваться (мгновенно вернуть результат);
+            ``None`` — ждать бесконечно;
+            ``> 0.0`` — ждать указанное время в секундах.
 
-    timeout:
-      - 0 → не блокироваться (мгновенно вернуть результат)
-      - None → ждать бесконечно
-      - >0.0 → ждать указанное время в секундах
+    Raises:
+        AlreadyRunningError: Если lock-файл не удалось захватить за отведённое время.
     """
     lock = fasteners.InterProcessLock(path)
     blocking = (timeout is None) or (timeout > 0)
@@ -339,7 +384,11 @@ async def async_ipc_lock(path: str | Path, timeout: float | None = 0) -> AsyncGe
 @contextmanager
 def secure_umask(mask: int = 0o077) -> Generator[None, None, None]:
     """Контекстный менеджер для временной и безопасной установки umask процесса.
+
     Гарантирует восстановление исходной маски после выхода из блока.
+
+    Args:
+        mask: Временная маска прав (например, ``0o077``).
     """
     original_umask = os.umask(mask)
     log.debug(f"Установлена временная umask={oct(mask)} для повышения безопасности.")
@@ -351,7 +400,14 @@ def secure_umask(mask: int = 0o077) -> Generator[None, None, None]:
 
 
 def _format_bytes(size_bytes: int | float) -> str:
-    """Форматирует байты в человекочитаемый вид (B, KiB, MiB, GiB, TiB)."""
+    """Форматирует байты в человекочитаемый вид (B, KiB, MiB, GiB, TiB).
+
+    Args:
+        size_bytes: Размер в байтах (берётся по модулю).
+
+    Returns:
+        Строка вида ``"12.34 MiB"``.
+    """
     size_bytes = abs(size_bytes)
     for unit in ("B", "KiB", "MiB", "GiB"):
         if size_bytes < 1024.0:
@@ -361,7 +417,15 @@ def _format_bytes(size_bytes: int | float) -> str:
 
 
 def _format_duration(seconds: int | None) -> str:
-    """Форматирует секунды в mm:ss (или h:mm:ss для длинных файлов)."""
+    """Форматирует секунды в mm:ss (или h:mm:ss для длинных файлов).
+
+    Args:
+        seconds: Длительность в секундах; ``None`` или неположительное
+            значение дают ``"00:00"``.
+
+    Returns:
+        Строка вида ``"03:25"`` или ``"1:02:03"``.
+    """
     if seconds is None or seconds <= 0:
         return "00:00"
 
@@ -376,8 +440,18 @@ def _format_duration(seconds: int | None) -> str:
 
 
 def _sanitize_filename(filename: str) -> str:
-    """Очищает имя файла от запрещенных системных символов,
-    сохраняя читаемость, пробелы и unicode (кириллицу, эмодзи).
+    """Очищает имя файла от запрещённых системных символов.
+
+    Сохраняет читаемость, пробелы и unicode (кириллицу, эмодзи). Защищает
+    от зарезервированных имён Windows и обрезает длину до безопасной
+    по количеству байт UTF-8.
+
+    Args:
+        filename: Исходное имя файла.
+
+    Returns:
+        Безопасное имя файла; ``"unnamed_file"``, если после очистки
+        ничего не осталось.
     """
     MAX_FILENAME_BYTES = 215
     _RESERVED_NAMES = frozenset(
@@ -414,13 +488,27 @@ def _sanitize_filename(filename: str) -> str:
 
 
 def _calculate_file_hash_sync(file_path: Path) -> str:
-    """(СИНХРОННАЯ!) Вычисляет хэш-сумму BLAKE2b файла"""
+    """(СИНХРОННАЯ!) Вычисляет хэш-сумму BLAKE2b файла.
+
+    Args:
+        file_path: Путь к файлу.
+
+    Returns:
+        Hex-строка хэша.
+    """
     with open(file_path, "rb") as f:
         return hashlib.file_digest(f, "blake2b").hexdigest()
 
 
 def _get_existing_parent(path: Path) -> Path:
-    """Итеративно находит первый существующий родительский каталог."""
+    """Итеративно находит первый существующий родительский каталог.
+
+    Args:
+        path: Путь, который может не существовать.
+
+    Returns:
+        Ближайший существующий родитель (или сам путь, если он существует).
+    """
     current = path.resolve()
     while not current.exists() and current.parent != current:
         current = current.parent
@@ -428,7 +516,14 @@ def _get_existing_parent(path: Path) -> Path:
 
 
 def _get_size_safely(path: Path) -> int:
-    """Возвращает размер обычного файла. Для симлинков/ошибок — 0."""
+    """Возвращает размер обычного файла.
+
+    Args:
+        path: Путь к файлу.
+
+    Returns:
+        Размер в байтах; ``0`` для симлинков, каталогов и при ошибках.
+    """
     try:
         st = path.lstat()
         if statmod.S_ISLNK(st.st_mode):
@@ -443,7 +538,11 @@ def _get_size_safely(path: Path) -> int:
 
 
 def remember_chat(chat: types.Chat) -> None:
-    """Запоминает отображаемое имя чата."""
+    """Запоминает отображаемое имя чата.
+
+    Args:
+        chat: Объект чата Telegram.
+    """
     name = chat.title or " ".join(
         p
         for p in (
@@ -458,7 +557,14 @@ def remember_chat(chat: types.Chat) -> None:
 
 @functools.cache
 def _username_from_session(chat_id: int) -> str | None:
-    """Юзернейм из файла сессии (только чтение). None — не нашли/не смогли."""
+    """Юзернейм из файла сессии (только чтение).
+
+    Args:
+        chat_id: Числовой ID чата.
+
+    Returns:
+        Юзернейм или ``None``, если не нашли / не смогли прочитать.
+    """
     try:
         with sqlite3.connect(f"file:{SESSION_NAME}.session?mode=ro", uri=True) as conn:
             row = conn.execute(
@@ -471,7 +577,14 @@ def _username_from_session(chat_id: int) -> str | None:
 
 @functools.cache
 def _id_from_session(identifier: str) -> int | None:
-    """Обратный резолв: @username / t.me-ссылка -> id из файла сессии."""
+    """Обратный резолв: @username / t.me-ссылка -> id из файла сессии.
+
+    Args:
+        identifier: Строка вида ``@username`` или ссылка ``t.me/...``.
+
+    Returns:
+        Числовой ID чата или ``None``, если не найден / не распознан.
+    """
     raw = identifier.strip()
 
     if not raw:
@@ -510,7 +623,14 @@ def _id_from_session(identifier: str) -> int | None:
 
 
 def chat_label(chat_id: int) -> str:
-    """Человеческое имя чата для логов согласно chat_label_parts."""
+    """Человеческое имя чата для логов согласно ``chat_label_parts``.
+
+    Args:
+        chat_id: Числовой ID чата.
+
+    Returns:
+        Строка вида ``"Название [@user | -100...]"`` (состав зависит от конфига).
+    """
     name, username = CHAT_LABELS.get(chat_id, ("", None))
 
     if username is None:
@@ -543,7 +663,18 @@ def chat_label(chat_id: int) -> str:
 
 
 def chat_id_or_username(identifier: str) -> ChatID:
-    """Тип для argparse: числовой ID как есть, юзернейм — через файл сессии."""
+    """Тип-функция для argparse: числовой ID как есть, юзернейм — через файл сессии.
+
+    Args:
+        identifier: Число, ``@username`` или t.me-ссылка.
+
+    Returns:
+        Числовой ID чата.
+
+    Raises:
+        argparse.ArgumentTypeError: Если идентификатор не число и не найден
+            в файле сессии.
+    """
     try:
         return int(identifier)
     except ValueError:
@@ -565,7 +696,14 @@ def chat_id_or_username(identifier: str) -> ChatID:
 
 
 async def check_disk_space() -> bool:
-    """Главная функция-диспетчер для проверки свободного места на диске."""
+    """Функция-диспетчер для проверки свободного места на диске.
+
+    Выбирает стратегию по конфигу: ``MIN_FREE_SPACE_MB > 0`` — статическая
+    проверка (фиксированный лимит), иначе динамическая (расчёт от размера БД).
+
+    Returns:
+        ``True``, если места достаточно для продолжения работы.
+    """
     if MIN_FREE_SPACE_MB > 0:
         log.info("Выполняется СТАТИЧЕСКАЯ проверка свободного места...")
         return await asyncio.to_thread(
@@ -577,7 +715,15 @@ async def check_disk_space() -> bool:
 
 
 def _check_static_disk_space(path_to_check: Path, required_mb: float) -> bool:
-    """Проверяет наличие достаточного статического количества свободного места."""
+    """Проверяет наличие достаточного статического количества свободного места.
+
+    Args:
+        path_to_check: Путь, на разделе которого проверяется свободное место.
+        required_mb: Требуемое количество свободного места в МБ.
+
+    Returns:
+        ``True``, если свободного места не меньше требуемого.
+    """
     try:
         target_path = _get_existing_parent(path_to_check)
         if not target_path.exists():
@@ -600,7 +746,14 @@ def _check_static_disk_space(path_to_check: Path, required_mb: float) -> bool:
 
 
 async def _check_dynamic_disk_space() -> bool:
-    """Выполняет умный динамический расчет необходимого места."""
+    """Выполняет динамический расчёт необходимого свободного места.
+
+    Оценивает потребность по размеру БД и бэкапов с учётом коэффициента
+    роста и буфера безопасности из конфига.
+
+    Returns:
+        ``True``, если расчётная потребность удовлетворена.
+    """
     try:
         db_size, backups_size = await asyncio.to_thread(_scan_project_files_sync)
 
@@ -644,7 +797,11 @@ async def _check_dynamic_disk_space() -> bool:
 
 
 def _scan_project_files_sync() -> tuple[int, int]:
-    """(СИНХРОННАЯ!) Безопасно сканирует файлы проекта, возвращая их размеры."""
+    """(СИНХРОННАЯ!) Безопасно сканирует файлы проекта, возвращая их размеры.
+
+    Returns:
+        Кортеж ``(размер_БД_с_wal_shm, размер_бэкапов)`` в байтах.
+    """
     db_path = Path(DB_FILE)
 
     db_main_size = _get_size_safely(db_path)
@@ -750,7 +907,18 @@ async def _perform_backup_creation(
     source_db_path: Path, backup_dir: Path, db_hash: str
 ) -> Path | None:
     """Атомарно создает одну новую резервную копию.
-    Возвращает путь к ней или None в случае ошибки.
+
+    Пишет во временный файл и переименовывает его только после успешного
+    завершения; сохраняет хэш-состояние БД для режима
+    ``backup_only_if_changed``.
+
+    Args:
+        source_db_path: Путь к исходной БД.
+        backup_dir: Каталог для бэкапов.
+        db_hash: Хэш-сумма текущего состояния БД.
+
+    Returns:
+        Путь к созданному бэкапу или ``None`` в случае ошибки.
     """
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     final_backup_path = backup_dir / f"{source_db_path.stem}_{timestamp}.sqlite.bak"
@@ -803,7 +971,12 @@ async def _perform_backup_creation(
 
 
 async def _perform_rotation(source_db_path: Path, backup_dir: Path) -> None:
-    """Выполняет ротацию бэкапов и архивов согласно настройкам."""
+    """Выполняет ротацию бэкапов и архивов согласно настройкам.
+
+    Args:
+        source_db_path: Путь к исходной БД (для выделения её бэкапов по имени).
+        backup_dir: Каталог с бэкапами.
+    """
     db_stem = source_db_path.stem
 
     # --- Ротация "горячих" бэкапов (.bak) ---
@@ -864,7 +1037,11 @@ async def _perform_rotation(source_db_path: Path, backup_dir: Path) -> None:
 
 
 async def _archive_backup_file(backup_path: Path) -> None:
-    """Атомарно сжимает один файл бэкапа и удаляет исходник."""
+    """Атомарно сжимает один файл бэкапа и удаляет исходник.
+
+    Args:
+        backup_path: Путь к файлу бэкапа (``*.sqlite.bak``).
+    """
     archive_path = backup_path.with_suffix(backup_path.suffix + ".xz")
     tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
     try:
@@ -880,7 +1057,13 @@ async def _archive_backup_file(backup_path: Path) -> None:
 
 
 def _compress_file_sync(source_path: Path, dest_path: Path, preset: int) -> None:
-    """(СИНХРОННАЯ!) Вспомогательная функция для сжатия файла с заданным пресетом."""
+    """(СИНХРОННАЯ!) Сжимает файл в lzma-архив с заданным пресетом.
+
+    Args:
+        source_path: Исходный файл.
+        dest_path: Путь итогового архива.
+        preset: Уровень сжатия lzma (0-9).
+    """
     with (
         open(source_path, "rb") as f_in,
         lzma.open(dest_path, "wb", preset=preset, check=lzma.CHECK_CRC64) as f_out,
@@ -896,7 +1079,11 @@ def _compress_file_sync(source_path: Path, dest_path: Path, preset: int) -> None
 
 # todo Добавить версирование БД user_version
 async def initialize_database() -> None:
-    """Выполняется ОДИН РАЗ при запуске. Создает новую схему БД."""
+    """Выполняется ОДИН РАЗ при запуске. Создает новую схему БД.
+
+    Таблицы ``audios`` и ``chat_sync_state`` создаются с ``IF NOT EXISTS``,
+    включается WAL-режим и создаются индексы для поиска дубликатов.
+    """
     log.debug("Инициализация схемы базы данных...")
     async with aiosqlite.connect(DB_FILE) as conn:
         async with conn.execute("PRAGMA journal_mode = WAL;") as cursor:
@@ -938,7 +1125,14 @@ async def initialize_database() -> None:
 
 @asynccontextmanager
 async def create_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
-    """Создает и возвращает НОВОЕ, полностью настроенное асинхронное соединение с БД."""
+    """Контекстный менеджер: новое, полностью настроенное соединение с БД.
+
+    Применяет PRAGMA-настройки из конфига (synchronous, temp_store,
+    cache_size) и включает row_factory = aiosqlite.Row.
+
+    Yields:
+        Настроенное асинхронное соединение (закрывается при выходе).
+    """
     log.debug("Создание нового оптимизированного соединения с БД...")
 
     async with aiosqlite.connect(DB_FILE) as conn:
@@ -963,10 +1157,13 @@ async def create_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
 
 async def validate_database() -> bool:
     """Проверяет целостность БД.
-    Возвращает False (блокирует запуск), если:
-    1. Файл БД физически поврежден.
-    2. Отсутствуют обязательные таблицы.
-    3. В таблице audios есть критически поврежденные данные (нужна команда repair).
+
+    Returns:
+        ``False`` (блокирует запуск), если:
+        1. Файл БД физически повреждён.
+        2. Отсутствуют обязательные таблицы.
+        3. В таблице audios есть критически повреждённые данные
+           (нужна команда ``repair``).
     """
     log.info("Валидация базы данных...")
     warnings = 0
@@ -1049,7 +1246,13 @@ async def validate_database() -> bool:
 
 async def repair_database(app: Client) -> None:
     """Выполняет умное восстановление и очистку базы данных.
-    Пытается восстановить поврежденные записи, используя данные из Telegram.
+
+    Пытается восстановить повреждённые записи, используя данные из Telegram,
+    сбрасывает некорректные курсоры синхронизации, пересоздаёт индексы
+    и выполняет VACUUM.
+
+    Args:
+        app: Клиент Telegram для сверки записей с сервером.
     """
     log.info("=" * 15 + "ЗАПУСК РЕМОНТА БД" + "=" * 15)
 
@@ -1092,6 +1295,7 @@ async def repair_database(app: Client) -> None:
             semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
 
             async def fetch_and_process_chunk(chat_id, chunk_ids):
+                """Сверяет один чанк message_id с Telegram и раскладывает результат."""
                 async with semaphore:
                     try:
                         messages = await app.get_messages(chat_id, chunk_ids)
@@ -1181,11 +1385,18 @@ def _build_export_path(
     ext: str,
     ts: str | None = None,
 ) -> Path:
-    """Строит путь файла экспорта: exports/<chat>/<ts>_<kind>.<ext>.
+    """Строит путь файла экспорта: ``exports/<chat>/<ts>_<kind>.<ext>``.
 
-    chat_id == 0 — полный экспорт всей БД, кладётся в exports/_full с именем БД
-    в имени файла. chat_id хранится "сырым". ts по умолчанию — текущий момент
-    (секунды); для прогонов по нескольким чатам считается один раз и пробрасывается.
+    Args:
+        chat_id: ID чата (хранится "сырым"); ``0`` — полный экспорт всей БД,
+            кладётся в ``exports/_full`` с именем БД в имени файла.
+        kind: Назначение файла (напр. ``"filenames"``, ``"report_duplicates"``).
+        ext: Расширение (напр. ``"txt"``, ``"csv"``).
+        ts: Таймстемп; ``None`` — текущий момент. Для прогонов по нескольким
+            чатам считается один раз и пробрасывается.
+
+    Returns:
+        Путь к файлу экспорта (каталог создаётся при необходимости).
     """
     if ts is None:
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1205,8 +1416,13 @@ def _build_export_path(
 async def _generic_export_to_txt(
     chat_id: ChatID, output_file: str, sql_query: str, line_formatter: RowFormatter
 ) -> None:
-    """Общая (generic) функция для экспорта данных из БД в текстовый файл.
-    Принимает SQL-запрос и функцию-форматтер для строк.
+    """Общая функция для экспорта данных из БД в текстовый файл.
+
+    Args:
+        chat_id: ID чата (подставляется в запрос первым параметром).
+        output_file: Путь к итоговому файлу.
+        sql_query: SQL-запрос с одним плейсхолдером ``?`` для chat_id.
+        line_formatter: Функция ``DBRow -> str | None``; ``None`` пропускает строку.
     """
     log.info(f"Запущена задача экспорта для чата {chat_label(chat_id)} в файл '{output_file}'...")
 
@@ -1227,7 +1443,7 @@ async def _generic_export_to_txt(
         log.info(f"Найдено {len(data_rows)} записей. Записываю в файл...")
 
         def write_to_file_sync():
-            """Синхронная функция для записи в файл."""
+            """(СИНХРОННАЯ!) Пишет строки экспорта в файл."""
             with open(output_file, "w", encoding="utf-8") as f:
                 for row in data_rows:
                     line = line_formatter(row)
@@ -1253,9 +1469,15 @@ async def _generic_export_to_csv(
 ) -> None:
     """Общая функция для экспорта данных из БД в CSV.
 
-    chat_id == 0 — полный экспорт всей БД (используется sql_query_full
-    без параметров). Форматтер возвращает список полей строки или None,
-    чтобы пропустить запись.
+    Args:
+        chat_id: ID чата; ``0`` — полный экспорт всей БД
+            (используется ``sql_query_full`` без параметров).
+        kind: Назначение файла (используется в имени).
+        sql_query: SQL-запрос для конкретного чата (с плейсхолдером ``?``).
+        sql_query_full: SQL-запрос для полного экспорта (без параметров).
+        header: Заголовок CSV (список имён колонок).
+        row_formatter: Функция ``DBRow -> list[str] | None``; ``None``
+            пропускает запись.
     """
     is_full_export = chat_id == 0
     output_file = _build_export_path(chat_id, kind, "csv")
@@ -1289,6 +1511,7 @@ async def _generic_export_to_csv(
         log.info(f"Найдено {len(data_rows)} записей. Обработка и сохранение в CSV...")
 
         def write_to_file_sync():
+            """(СИНХРОННАЯ!) Пишет строки экспорта в CSV."""
             import csv
 
             # utf-8-sig нужен, чтобы Excel автоматически правильно распознал кириллицу
@@ -1311,7 +1534,11 @@ async def _generic_export_to_csv(
 
 
 async def export_filenames_to_txt(chat_id: ChatID) -> None:
-    """Экспортирует ТОЛЬКО имена файлов. (Функция-обертка)"""
+    """Экспортирует ТОЛЬКО имена файлов (функция-обёртка).
+
+    Args:
+        chat_id: ID чата, для которого экспортировать имена.
+    """
     output_file = _build_export_path(chat_id, "filenames", "txt")
 
     await _generic_export_to_txt(
@@ -1323,7 +1550,11 @@ async def export_filenames_to_txt(chat_id: ChatID) -> None:
 
 
 async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
-    """Экспортирует имена файлов и ССЫЛКИ. (Функция-обертка)"""
+    """Экспортирует имена файлов и ссылки на сообщения (функция-обёртка).
+
+    Args:
+        chat_id: ID чата, для которого экспортировать имена со ссылками.
+    """
     try:
         from wcwidth import wcswidth
     except ImportError:
@@ -1370,9 +1601,12 @@ async def export_filenames_with_url_to_txt(chat_id: ChatID) -> None:
 
 
 async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
-    """Экспортирует процесс очистки имен файлов в CSV для проверки работы фильтров.
-    Формат: Исходное имя, После _clean_filename, После default_process
-    Если chat_id == 0, экспортируется вся база целиком.
+    """Экспортирует процесс очистки имён файлов в CSV для проверки фильтров.
+
+    Формат: Исходное имя, После ``_clean_filename``, После ``default_process``.
+
+    Args:
+        chat_id: ID чата; ``0`` — экспорт всей базы целиком.
     """
 
     def formatter(row: DBRow) -> list[str] | None:
@@ -1394,9 +1628,12 @@ async def export_cleaned_names_to_csv(chat_id: ChatID) -> None:
 
 async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
     """Экспортирует процесс очистки метаданных (performer+title) в CSV.
-    Формат: Performer, Title, После _clean_meta, После default_process
+
+    Формат: Performer, Title, После ``_clean_meta``, После ``default_process``.
     Показывает ровно ту строку, которую видит fuzzy-матчер.
-    Если chat_id == 0, экспортируется вся база целиком.
+
+    Args:
+        chat_id: ID чата; ``0`` — экспорт всей базы целиком.
     """
 
     def formatter(row: DBRow) -> list[str] | None:
@@ -1423,7 +1660,15 @@ async def export_cleaned_meta_to_csv(chat_id: ChatID) -> None:
 
 
 async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
-    """Скачивает все аудиофайлы из указанного чата в локальную папку downloads."""
+    """Скачивает все аудиофайлы из указанного чата в локальную папку downloads.
+
+    Уже скачанные файлы пропускаются по размеру и дате изменения;
+    скачивание идёт пулом воркеров с прогрессом в TTY.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID чата, чьи аудио скачивать.
+    """
     log.info(f"Запуск режима СКАЧИВАНИЯ для чата {chat_label(chat_id)}...")
 
     download_dir = Path(DOWNLOADS_DIR) / str(chat_id)
@@ -1520,6 +1765,7 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
         return progress
 
     async def worker():
+        """Воркер очереди скачивания: подготавливает имя и качает файл."""
         while True:
             try:
                 task_item = await queue.get()
@@ -1704,8 +1950,10 @@ async def download_chat_audio(app: Client, chat_id: ChatID) -> None:
 
 async def export_database_to_xlsx(chat_id: ChatID) -> None:
     """Универсальный экспорт БД в Excel.
-    Если chat_id == 0, экспортируется вся база целиком.
-    Иначе — данные фильтруются по конкретному чату.
+
+    Args:
+        chat_id: ID чата; ``0`` — вся база целиком, иначе данные
+            фильтруются по конкретному чату.
     """
     try:
         import openpyxl
@@ -1886,7 +2134,14 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
 async def create_duplicates_report(
     chat_id: ChatID, conn: aiosqlite.Connection, ts: str | None = None
 ) -> None:
-    """Создает человекочитаемый отчет о дубликатах с ссылками."""
+    """Создает человекочитаемый отчёт о дубликатах со ссылками.
+
+    Args:
+        chat_id: ID чата, по которому строится отчёт.
+        conn: Соединение с БД.
+        ts: Общий таймстемп прогона (для одинаковых имён файлов отчётов);
+            ``None`` — текущий момент.
+    """
     log.info(f"Генерация отчета по дубликатам для чата {chat_label(chat_id)}...")
 
     groups, edge_meta = await _get_potential_duplicate_groups(chat_id, conn)
@@ -1995,6 +2250,7 @@ async def create_duplicates_report(
     buf.close()
 
     def _write() -> None:
+        """(СИНХРОННАЯ!) Записывает готовый текст отчёта в файл."""
         with open(report_file, "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -2011,7 +2267,10 @@ async def create_duplicates_report(
 
 async def create_telegram_client() -> Client | None:
     """Создает, настраивает и возвращает экземпляр клиента Kurigram.
-    В случае критической ошибки конфигурации (например, кривой прокси) возвращает None.
+
+    Returns:
+        Настроенный клиент или ``None`` при критической ошибке конфигурации
+        (например, кривой прокси).
     """
     client_kwargs: dict[str, Any] = {
         "api_id": API_ID,
@@ -2072,9 +2331,18 @@ async def resolve_chat_identifiers(
     identifiers: list[str],
     banner: str | None = "Преобразую идентификаторы чатов в числовые ID...",
 ) -> list[ChatID]:
-    """Преобразует список идентификаторов чатов (числовые ID и @usernames)
-    в список уникальных числовых ID с сохранением исходного порядка.
-    Использует контролируемые конкурентные запросы к API.
+    """Преобразует список идентификаторов чатов в уникальные числовые ID.
+
+    Числовые ID проходят как есть, юзернеймы резолвятся конкурентными
+    запросами к API; порядок входного списка сохраняется.
+
+    Args:
+        app: Клиент Telegram.
+        identifiers: Список строк — числа, ``@usernames`` или ссылки.
+        banner: Заголовок для лога; ``None`` — не печатать.
+
+    Returns:
+        Список уникальных числовых ID в порядке первого появления.
     """
     if banner:
         log.info(f"\n{'=' * 20}\n{banner}")
@@ -2096,6 +2364,7 @@ async def resolve_chat_identifiers(
 
     # 2. Резолв одного идентификатора: число -> само, имя -> API (или None)
     async def resolve_one(ident: str) -> ChatID | None:
+        """Резолвит один идентификатор: число — само, имя — через API."""
         try:
             chat_id = int(ident)
             log.debug(f"Идентификатор '{ident}' распознан как числовой ID.")
@@ -2152,9 +2421,16 @@ async def resolve_chat_identifiers(
 async def resolve_and_validate_archive_target(app: Client, me_id: int) -> ChatID | None:
     """Резолвит ARCHIVE_TARGET в числовой ID и проверяет возможность записи.
 
-    Возвращает ID при успехе, иначе None. 'me'/'self' → Избранное.
-    Жёстко проверяются только каналы (нужны права на постинг); для групп
-    полагаемся на runtime fail-safe в _archive_chunk.
+    ``'me'``/``'self'`` → Избранное. Жёстко проверяются только каналы (нужны
+    права на постинг); для групп полагаемся на runtime fail-safe в
+    ``_archive_chunk``.
+
+    Args:
+        app: Клиент Telegram.
+        me_id: ID текущего аккаунта.
+
+    Returns:
+        ID архивного чата или ``None``, если цель недоступна/нет прав.
     """
     log.info(f"\n{'=' * 20}\nПроверяю архивную цель '{ARCHIVE_TARGET}'...")
     resolved = await resolve_chat_identifiers(app, [ARCHIVE_TARGET], banner=None)
@@ -2196,8 +2472,17 @@ async def resolve_and_validate_archive_target(app: Client, me_id: int) -> ChatID
 
 
 async def populate_ignore_list(app: Client) -> None:
-    """Обрабатывает RAW_IGNORE_LIST и RAW_IGNORE_REGEX: разрешает юзернеймы в ID
-    и заполняет IGNORE_MESSAGES / IGNORE_REGEX / GLOBAL_IGNORE_REGEX.
+    """Обрабатывает RAW_IGNORE_LIST и RAW_IGNORE_REGEX.
+
+    Разрешает юзернеймы в ID и заполняет ``IGNORE_MESSAGES`` /
+    ``IGNORE_REGEX`` / ``GLOBAL_IGNORE_REGEX``.
+
+    Args:
+        app: Клиент Telegram для резолва юзернеймов.
+
+    Raises:
+        IgnoreListResolutionError: Если какой-либо идентификатор из списков
+            исключений не удалось проверить через API.
     """
     if not RAW_IGNORE_LIST and not RAW_IGNORE_REGEX:
         return
@@ -2230,6 +2515,7 @@ async def populate_ignore_list(app: Client) -> None:
     semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
 
     async def resolve_task(identifier: str):
+        """Резолвит один юзернейм ignore-списка в числовой ID."""
         async with semaphore:
             chat = await app.get_chat(identifier)
             remember_chat(chat)
@@ -2258,7 +2544,17 @@ async def populate_ignore_list(app: Client) -> None:
 
 
 async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Namespace) -> bool:
-    """Проверяет права доступа к чату."""
+    """Проверяет права доступа к чату.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID проверяемого чата.
+        me_id: ID текущего аккаунта.
+        args: Аргументы CLI (определяют режим read-only).
+
+    Returns:
+        ``True``, если чат доступен для обработки в текущем режиме.
+    """
     try:
         log.info(f"\n{'=' * 20}\nПроверка прав для чата {chat_label(chat_id)}...")
 
@@ -2311,9 +2607,12 @@ async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Names
 
 def _get_audio_attributes(message: types.Message | None) -> AudioMeta | None:
     """Проверяет, является ли сообщение аудио или аудио-документом.
-    Возвращает AudioMeta с атрибутами
-    (file_unique_id, file_name, file_size, duration, performer, title)
-    или None, если это не аудиофайл.
+
+    Args:
+        message: Сообщение Telegram (может быть ``None``/empty/service).
+
+    Returns:
+        ``AudioMeta`` с атрибутами или ``None``, если это не аудиофайл.
     """
     if not message or message.empty or message.service:
         return None
@@ -2354,7 +2653,15 @@ async def _flush_audio_batch(
     conn: aiosqlite.Connection,
     batch: list[tuple],
 ) -> int:
-    """Вставляет батч аудио и коммитит."""
+    """Вставляет батч аудио и коммитит.
+
+    Args:
+        conn: Соединение с БД.
+        batch: Список кортежей со значениями колонок ``audios``.
+
+    Returns:
+        Число реально вставленных строк (``INSERT OR IGNORE``).
+    """
     cur = await conn.executemany(
         "INSERT OR IGNORE INTO audios (chat_id, message_id, file_unique_id, file_name, file_size, duration, performer, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         batch,
@@ -2370,7 +2677,15 @@ async def _get_media_total(
     is_incremental: bool,
 ) -> int | None:
     """Пытается получить общее количество сообщений для прогресса.
-    Возвращает None если не удалось или не нужно (инкрементальный режим).
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID чата.
+        media_filter: Фильтр типа медиа (AUDIO или DOCUMENT).
+        is_incremental: Инкрементальный режим — total не нужен.
+
+    Returns:
+        Общее число сообщений или ``None``, если получить не удалось/не нужно.
     """
     if is_incremental:
         return None
@@ -2388,9 +2703,17 @@ async def sync_messages(
 ) -> None:
     """Синхронизация: поиск AUDIO + DOCUMENT на серверах Telegram.
 
-    • Каждый батч коммитится отдельно.
-    • Курсор обновляется ТОЛЬКО в конце.
-    • INSERT OR IGNORE — идемпотентность.
+    Каждый батч коммитится отдельно; курсор обновляется только в конце;
+    ``INSERT OR IGNORE`` даёт идемпотентность.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID синхронизируемого чата.
+        conn: Соединение с БД.
+
+    Raises:
+        Exception: Любая ошибка синхронизации — транзакция откатывается
+            и ошибка пробрасывается наверх.
     """
     log.info(f"\n{'=' * 40}\nНачинаю синхронизацию чата {chat_label(chat_id)}")
 
@@ -2513,7 +2836,17 @@ async def find_and_process_duplicates(
     conn: aiosqlite.Connection,
     archive_target_id: ChatID | None = None,
 ) -> None:
-    """ЭТАП 2 (Оркестратор): Анализирует дубликаты и формирует списки действий."""
+    """Оркестратор анализа дубликатов: формирует списки действий.
+
+    Находит группы потенциальных дубликатов в БД, верифицирует их через
+    API, классифицирует и передаёт результат на исполнение.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID обрабатываемого чата.
+        conn: Соединение с БД.
+        archive_target_id: ID архивного чата, если включена архивация.
+    """
     log.info(f"\n{'=' * 10}\nНачинаю анализ дубликатов в чате {chat_label(chat_id)}...")
 
     # Шаг 1: Найти группы потенциальных дубликатов в локальной базе данных
@@ -2548,12 +2881,17 @@ async def find_and_process_duplicates(
 
 
 def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[DuplicateGroup], EdgeMeta]:
-    """(ЧИСТАЯ ФУНКЦИЯ) Группирует записи, используя обход графа
-    для нахождения связных компонентов (транзитивных связей).
+    """(ЧИСТАЯ ФУНКЦИЯ) Группирует записи точных совпадений.
+
+    Обход графа находит связные компоненты (транзитивные связи) по
+    ``file_unique_id`` и полному совпадению метаданных.
+
+    Args:
+        all_audios: Записи БД одного чата.
 
     Returns:
-        Кортеж (groups, edge_meta): группы дубликатов (len >= 2) и
-        метаданные связей с причиной "uid"/"meta" для отчёта.
+        Кортеж ``(groups, edge_meta)``: группы дубликатов (``len >= 2``) и
+        метаданные связей с причиной ``"uid"``/``"meta"`` для отчёта.
     """
     if not all_audios:
         return [], {}
@@ -2707,7 +3045,14 @@ def _clean_filename(fname: str | None) -> str:
 
 
 def _process_for_fuzzy(cleaned_name: str) -> str:
-    """default_process + схлопывание пробелов — финальная форма для fuzzy."""
+    """``default_process`` + схлопывание пробелов — финальная форма для fuzzy.
+
+    Args:
+        cleaned_name: Строка после ``_clean_filename``/``_clean_meta``.
+
+    Returns:
+        Нормализованная строка для передачи в RapidFuzz.
+    """
     return " ".join(default_process(cleaned_name).split())
 
 
@@ -2722,11 +3067,18 @@ _SRC_LABEL = {
 
 
 def _clean_meta(performer: str | None, title: str | None) -> str:
-    """performer+title, очищенные тем же пайплайном, что и имя файла.
+    """``performer+title``, очищенные тем же пайплайном, что и имя файла.
 
     Единая нормализация важнее точечной: имя и мета должны сравниваться
-    в одной форме. Плейсхолдеры вида '<unknown>' отбрасываются как
-    отсутствующие значения. Пусто, если не осталось ни performer, ни title.
+    в одной форме. Плейсхолдеры вида ``'<unknown>'`` отбрасываются как
+    отсутствующие значения.
+
+    Args:
+        performer: Исполнитель из тегов (может быть ``None``).
+        title: Название из тегов (может быть ``None``).
+
+    Returns:
+        Очищенная строка; пустая, если не осталось ни performer, ни title.
     """
     parts = [p for p in (performer, title) if p and not _RE_META_PLACEHOLDER.match(p)]
     if not parts:
@@ -2735,7 +3087,14 @@ def _clean_meta(performer: str | None, title: str | None) -> str:
 
 
 def _src_suffix(src: int | None) -> str:
-    """Подпись источника для отчёта, напр. '(мета-мета)'. Пусто для uid/meta."""
+    """Подпись источника для отчёта, напр. ``'(мета-мета)'``.
+
+    Args:
+        src: Код источника (0..3) или ``None`` для uid/meta.
+
+    Returns:
+        Строка-суффикс в скобках или ``""``.
+    """
     return f"({_SRC_LABEL[src]})" if src is not None else ""
 
 
@@ -2814,11 +3173,11 @@ def _uid_prepass(
     Telegram — совпадение гарантировано, fuzzy не нужен.
 
     Args:
-        ids:       Массив message_id (int64), параллельный ``uids``.
-        uids:      Список file_unique_id (может содержать ``None``).
+        ids: Массив message_id (int64), параллельный ``uids``.
+        uids: Список file_unique_id (может содержать ``None``).
         adjacency: Граф смежности — модифицируется на месте.
         edge_meta: Метаданные рёбер — модифицируется на месте; для каждой
-                   UID-связи пишется EdgeInfo(reason="uid").
+            UID-связи пишется EdgeInfo(reason="uid").
 
     Returns:
         Количество добавленных UID-связей.
@@ -2864,18 +3223,18 @@ def _compute_window_scores(
     пороги, score по длительности и score по размеру.
 
     Args:
-        i:                Индекс текущего файла в отсортированном массиве.
-        window_end:       Правая граница скользящего окна (exclusive).
-        durations:        Массив длительностей (int32).
-        sizes:            Массив размеров файлов (float64).
-        buf_thresholds:   Pre-allocated буфер порогов (изменяется на месте).
-        buf_scores_dur:   Pre-allocated буфер score по длительности.
-        buf_scores_size:  Pre-allocated буфер score по размеру.
-        base_threshold:   Базовый порог схожести (FUZZY_THRESHOLD).
-        w_dur:            Вес длительности (WEIGHT_DURATION).
-        w_size:           Вес размера (WEIGHT_SIZE).
-        dur_power:        Показатель степени для score длительности (DURATION_POWER).
-        size_power:       Показатель степени для score размера (SIZE_POWER).
+        i: Индекс текущего файла в отсортированном массиве.
+        window_end: Правая граница скользящего окна (exclusive).
+        durations: Массив длительностей (int32).
+        sizes: Массив размеров файлов (float64).
+        buf_thresholds: Pre-allocated буфер порогов (изменяется на месте).
+        buf_scores_dur: Pre-allocated буфер score по длительности.
+        buf_scores_size: Pre-allocated буфер score по размеру.
+        base_threshold: Базовый порог схожести (FUZZY_THRESHOLD).
+        w_dur: Вес длительности (WEIGHT_DURATION).
+        w_size: Вес размера (WEIGHT_SIZE).
+        dur_power: Показатель степени для score длительности (DURATION_POWER).
+        size_power: Показатель степени для score размера (SIZE_POWER).
 
     Returns:
         Три view-а на буферы (dynamic_thresholds, scores_dur, scores_size)
@@ -2945,18 +3304,18 @@ def _optimistic_filter(
     бы кандидатов, совпадающих по мете).
 
     Args:
-        i:                  Индекс текущего файла.
-        window_end:         Правая граница окна (exclusive).
-        name_lengths:       Массив длин обработанных имён (int32).
-        scores_dur:         Score по длительности (view на буфер).
-        scores_size:        Score по размеру (view на буфер).
+        i: Индекс текущего файла.
+        window_end: Правая граница окна (exclusive).
+        name_lengths: Массив длин обработанных имён (int32).
+        scores_dur: Score по длительности (view на буфер).
+        scores_size: Score по размеру (view на буфер).
         dynamic_thresholds: Динамические пороги (view на буфер).
-        w_name:             Вес имени.
-        w_dur:              Вес длительности.
-        w_size:             Вес размера.
-        name_power:         Степень текстового score.
-        fuzzy_mode:         ``"set"`` или ``"sort"``.
-        use_meta:           мета fuzzy включён
+        w_name: Вес имени.
+        w_dur: Вес длительности.
+        w_size: Вес размера.
+        name_power: Степень текстового score.
+        fuzzy_mode: ``"set"`` или ``"sort"``.
+        use_meta: Включена ли мета-fuzzy.
 
     Returns:
         Булева маска длиной ``window_end - i - 1``: ``True`` — кандидат
@@ -2990,7 +3349,7 @@ def _compute_penalty(
     иначе фиксированный ``PENALTY_NUMBERS_MISMATCH``.
 
     Args:
-        current_numbers:   Числа из имени текущего файла.
+        current_numbers: Числа из имени текущего файла.
         candidate_numbers: Числа из имени кандидата.
 
     Returns:
@@ -3017,10 +3376,10 @@ def _filter_already_connected(
     избежать повторных fuzzy-сравнений, результат которых не изменит граф.
 
     Args:
-        abs_indices:             Абсолютные индексы кандидатов.
-        valid_indices_relative:  Относительные индексы кандидатов (в окне).
-        ids:                     Массив message_id.
-        adjacency_i:             Множество соседей текущего узла (или ``None``).
+        abs_indices: Абсолютные индексы кандидатов.
+        valid_indices_relative: Относительные индексы кандидатов (в окне).
+        ids: Массив message_id.
+        adjacency_i: Множество соседей текущего узла (или ``None``).
 
     Returns:
         Отфильтрованные ``abs_indices``, ``valid_indices_relative`` и
@@ -3073,27 +3432,26 @@ def _match_batch(
     для выживших.
 
     Args:
-        i:                      Индекс текущего файла.
-        abs_indices:            Абсолютные индексы кандидатов.
+        i: Индекс текущего файла.
+        abs_indices: Абсолютные индексы кандидатов.
         valid_indices_relative: Относительные индексы кандидатов.
-        ids:                    Массив message_id.
-        names:                  Очищённые имена (для лога).
-        names_processed:        Обработанные имена (для fuzzy).
-        metas_processed:        Обработанная мета performer+title (для fuzzy).
-        numbers_cache:          Кэш числовых множеств из имён.
-        meta_numbers_cache:     Кэш числовых множеств из меты.
-        dynamic_thresholds:     Динамические пороги (view на буфер).
-        scores_dur:             Score по длительности (view).
-        scores_size:            Score по размеру (view).
-        fuzz_scorer:            ``fuzz.token_set_ratio`` или ``token_sort_ratio``.
-        w_name:                 Вес имени.
-        w_dur:                  Вес длительности.
-        w_size:                 Вес размера.
-        name_power:             Степень текстового score.
-        adjacency:              Граф смежности — модифицируется на месте.
-        edge_meta:              Метаданные рёбер — модифицируется на месте;
-                                для каждого совпадения пишется
-                                EdgeInfo(reason="fuzzy") с коэффициентами.
+        ids: Массив message_id.
+        names: Очищённые имена (для лога).
+        names_processed: Обработанные имена (для fuzzy).
+        metas_processed: Обработанная мета performer+title (для fuzzy).
+        numbers_cache: Кэш числовых множеств из имён.
+        meta_numbers_cache: Кэш числовых множеств из меты.
+        dynamic_thresholds: Динамические пороги (view на буфер).
+        scores_dur: Score по длительности (view).
+        scores_size: Score по размеру (view).
+        fuzz_scorer: ``fuzz.token_set_ratio`` или ``token_sort_ratio``.
+        w_name: Вес имени.
+        w_dur: Вес длительности.
+        w_size: Вес размера.
+        name_power: Степень текстового score.
+        adjacency: Граф смежности — модифицируется на месте.
+        edge_meta: Метаданные рёбер — модифицируется на месте; для каждого
+            совпадения пишется EdgeInfo(reason="fuzzy") с коэффициентами.
 
     Returns:
         Кортеж ``(comparisons, matches, matched_scores)`` — счётчики для статистики.
@@ -3270,9 +3628,9 @@ def _build_groups_bfs(
     Сложность O(N + E), где N — количество файлов, E — количество рёбер.
 
     Args:
-        ids:        Массив всех message_id (int64).
-        adjacency:  Граф смежности (только узлы с хотя бы одной связью).
-        id_to_row:  Словарь message_id → DBRow.
+        ids: Массив всех message_id (int64).
+        adjacency: Граф смежности (только узлы с хотя бы одной связью).
+        id_to_row: Словарь message_id → DBRow.
 
     Returns:
         Список компонент с размером ≥ 2 (одиночные файлы исключены).
@@ -3318,19 +3676,19 @@ def _log_stats(
     """Выводит сводную статистику fuzzy-поиска.
 
     Args:
-        count:                   Общее число файлов.
-        t_prep:                  Время подготовки данных (сек).
-        t_loop:                  Время основного цикла (сек).
-        t_bfs:                   Время сборки групп BFS (сек).
-        t_total:                 Полное время выполнения (сек).
-        stats_comparisons:       Число пар-кандидатов, дошедших до текстового этапа.
-        stats_uid_matches:       Число связей, найденных через UID.
-        stats_matches:           Число связей, найденных через fuzzy.
+        count: Общее число файлов.
+        t_prep: Время подготовки данных (сек).
+        t_loop: Время основного цикла (сек).
+        t_bfs: Время сборки групп BFS (сек).
+        t_total: Полное время выполнения (сек).
+        stats_comparisons: Число пар-кандидатов, дошедших до текстового этапа.
+        stats_uid_matches: Число связей, найденных через UID.
+        stats_matches: Число связей, найденных через fuzzy.
         stats_skipped_connected: Число пропущенных уже связанных пар.
-        num_groups:              Число найденных групп дубликатов.
-        match_scores:            Финальные score всех fuzzy-совпадений за весь прогон.
-                                 Если список непустой, выводятся min/p25/median/p75/max.
-                                 Пустой список допустим (например, совпадений не найдено).
+        num_groups: Число найденных групп дубликатов.
+        match_scores: Финальные score всех fuzzy-совпадений за весь прогон.
+            Если список непустой, выводятся min/p25/median/p75/max.
+            Пустой список допустим (например, совпадений не найдено).
     """
     if t_loop > 0 and stats_comparisons > 0:
         ops = stats_comparisons / t_loop
@@ -3573,8 +3931,13 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
 
 
 class KeepCriterion(NamedTuple):
-    """extract возвращает числовое значение критерия или None (= значение
-    отсутствует; такая запись проигрывает записям, у которых оно есть).
+    """Критерий каскада выбора оригинала.
+
+    Attributes:
+        extract: Возвращает числовое значение критерия для записи или
+            ``None`` (= значение отсутствует; такая запись проигрывает
+            записям, у которых оно есть).
+        prefer_max: ``True`` — большим значениям приоритет, ``False`` — меньшим.
     """
 
     extract: Callable[[DBRow], float | None]
@@ -3582,6 +3945,8 @@ class KeepCriterion(NamedTuple):
 
 
 def _extract_positive(field: str) -> Callable[[DBRow], float | None]:
+    """Фабрика экстрактора: положительное значение поля или ``None``."""
+
     def inner(r: DBRow) -> float | None:
         v = r[field]
         return float(v) if v and v > 0 else None
@@ -3600,13 +3965,22 @@ _META_PLACEHOLDERS: Final[frozenset[str]] = frozenset(
 
 
 def _meta_field_ok(value: str | None) -> bool:
+    """``True``, если поле меты заполнено и не является плейсхолдером."""
     v = (value or "").strip()
     return bool(v) and v.lower() not in _META_PLACEHOLDERS
 
 
 def _extract_has_meta(r: DBRow) -> float:
-    """0..2: качество тегов. Плейсхолдеры и title, совпадающий с именем
-    файла (мусор от сайтов-качалок), не считаются метаданными.
+    """Оценка качества тегов записи (0..2).
+
+    Плейсхолдеры и title, совпадающий с именем файла (мусор от
+    сайтов-качалок), не считаются метаданными.
+
+    Args:
+        r: Запись БД.
+
+    Returns:
+        0..2: по баллу за валидный performer и валидный title.
     """
     score = 0.0
     if _meta_field_ok(r["performer"]):
@@ -3619,6 +3993,7 @@ def _extract_has_meta(r: DBRow) -> float:
 
 
 def _extract_clean_name_len(r: DBRow) -> float | None:
+    """Длина очищенного имени файла или ``None`` для пустого имени."""
     cleaned = _clean_filename(r["file_name"])
     return float(len(cleaned)) if cleaned else None
 
@@ -3647,6 +4022,12 @@ def _cascade_winner(pool: list[DBRow]) -> DBRow:
     значение есть), затем остаются все в пределах допуска от лучшего.
     Уникальный tie-break (oldest/newest) в конце списка гарантирует,
     что каскад завершится ровно одним кандидатом.
+
+    Args:
+        pool: Записи-кандидаты одной группы.
+
+    Returns:
+        Запись-победитель каскада.
     """
     cands = pool
     for name, tol in KEEP_PRIORITY:
@@ -3670,6 +4051,12 @@ def _order_group_by_keep_priority(group: DuplicateGroup) -> list[DBRow]:
     Порядок нужен целиком: если лучший кандидат не пройдёт верификацию
     (удалён/изменён), оригиналом станет следующий. Повторный каскад по
     остатку — O(n²·C), но группы дубликатов крошечные.
+
+    Args:
+        group: Группа дубликатов.
+
+    Returns:
+        Записи группы в порядке убывания приоритета сохранения.
     """
     pool = list(group)
     ordered: list[DBRow] = []
@@ -3686,9 +4073,17 @@ def _order_group_by_keep_priority(group: DuplicateGroup) -> list[DBRow]:
 async def _get_potential_duplicate_groups(
     chat_id: ChatID, conn: aiosqlite.Connection
 ) -> tuple[list[DuplicateGroup], EdgeMeta]:
-    """ЭТАП 2.1: Запрашивает из БД все аудио и передает их чистой функции для группировки.
-    Возвращает группы дубликатов и метаданные связей (причина + коэффициенты)
-    для отчёта.
+    """Запрашивает из БД все аудио чата и передаёт их группировщику.
+
+    Тяжёлая группировка выполняется в отдельном потоке.
+
+    Args:
+        chat_id: ID анализируемого чата.
+        conn: Соединение с БД.
+
+    Returns:
+        Кортеж ``(groups, edge_meta)``: группы дубликатов и метаданные
+        связей (причина + коэффициенты) для отчёта.
     """
     log.debug(f"Анализ чата {chat_label(chat_id)}: Запрос всех аудиозаписей из локальной БД...")
     # Лимит тележки на сообщения 1 млн, т.е. на 1 чат максимум 1 млн записей, что не бьёт по ОЗУ
@@ -3713,13 +4108,23 @@ async def _get_potential_duplicate_groups(
 async def _verify_messages_from_api(
     app: Client, chat_id: ChatID, ids_to_verify: list[MessageID]
 ) -> VerifiedMessagesDict:
-    """ЭТАП 2.2: Надежно запрашивает у Telegram информацию о сообщениях по их ID.
+    """Надёжно запрашивает у Telegram информацию о сообщениях по их ID.
+
     Использует семафор для контроля параллельных запросов и пакетирование.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID чата.
+        ids_to_verify: Список message_id для проверки.
+
+    Returns:
+        Словарь ``message_id -> Message | None | Exception``.
     """
     verified_messages = {}
     semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
 
     async def fetch_chunk(chunk_ids):
+        """Загружает один чанк сообщений; при ошибке возвращает её."""
         async with semaphore:
             try:
                 return await app.get_messages(chat_id, chunk_ids)
@@ -3746,11 +4151,18 @@ async def _verify_messages_from_api(
 def _classify_verified_duplicates(
     duplicate_groups: list[DuplicateGroup], verified_messages: VerifiedMessagesDict
 ) -> ClassificationResult:
-    """ЭТАП 2.3: Анализирует верифицированные сообщения и принимает решение о действиях.
+    """Анализирует верифицированные сообщения и принимает решение о действиях.
 
-    ВАЖНО: Использует стратегию Fail-Safe. Если при проверке любого сообщения
-    в группе возникает ошибка API, вся группа пропускается для предотвращения
-    случайного удаления данных.
+    ВАЖНО: используется стратегия fail-safe — если при проверке любого
+    сообщения в группе возникает ошибка API, вся группа пропускается
+    для предотвращения случайного удаления данных.
+
+    Args:
+        duplicate_groups: Группы потенциальных дубликатов.
+        verified_messages: Результат ``_verify_messages_from_api``.
+
+    Returns:
+        ClassificationResult со списками действий.
     """
     to_delete_from_tg = set()
     to_delete_from_db = set()
@@ -3832,8 +4244,18 @@ async def _get_regex_protected_ids(
     tg_ids: list[MessageID],
     patterns: list[re.Pattern[str]],
 ) -> set[MessageID]:
-    """Возвращает ID сообщений, чьи file_name/performer/title матчатся
-    хотя бы одним паттерном. Читает метаданные из локальной БД.
+    """Возвращает ID сообщений, чьи метаданные матчатся regex-защитой.
+
+    Проверяет ``file_name``/``performer``/``title`` из локальной БД.
+
+    Args:
+        conn: Соединение с БД.
+        chat_id: ID чата.
+        tg_ids: Кандидаты на удаление.
+        patterns: Компилированные regex-паттерны защиты.
+
+    Returns:
+        Множество message_id, защищённых от удаления.
     """
     protected: set[MessageID] = set()
     CHUNK = 4000
@@ -3864,7 +4286,16 @@ async def _filter_ignored_ids(
     chat_id: ChatID,
     tg_ids: list[MessageID],
 ) -> list[MessageID]:
-    """Отсекает сообщения из ignore-листа и regex-защиты. Без побочных эффектов в БД."""
+    """Отсекает сообщения из ignore-листа и regex-защиты.
+
+    Args:
+        conn: Соединение с БД (для чтения метаданных regex-защиты).
+        chat_id: ID чата.
+        tg_ids: Кандидаты на удаление.
+
+    Returns:
+        Отфильтрованный список message_id без побочных эффектов в БД.
+    """
     ignore_list = IGNORE_MESSAGES.get(chat_id, set())
     final = [msg_id for msg_id in tg_ids if msg_id not in ignore_list]
     skipped = len(tg_ids) - len(final)
@@ -3892,7 +4323,15 @@ def _log_planned_changes(
     db_update_records: list[types.Message],
     archive_target_id: ChatID | None,
 ) -> None:
-    """DRY_RUN: печатает план без побочных эффектов."""
+    """Печатает план изменений (режим DRY_RUN) без побочных эффектов.
+
+    Args:
+        chat_id: ID чата.
+        tg_ids: Планируемые к удалению из Telegram.
+        db_delete_ids: Планируемые к удалению из БД.
+        db_update_records: Планируемые к обновлению в БД.
+        archive_target_id: ID архивного чата, если архивация включена.
+    """
     log.info("РЕЖИМ СИМУЛЯЦИИ АКТИВЕН. Никаких реальных изменений не будет.")
     if tg_ids:
         if ARCHIVE_BEFORE_DELETE and archive_target_id is not None:
@@ -3924,6 +4363,12 @@ async def _send_archive_header(
     """Шлёт в архив текстовый разделитель перед пересылкой батчей чата.
 
     Косметика: падение заголовка не должно останавливать архивацию.
+
+    Args:
+        app: Клиент Telegram.
+        archive_target_id: ID архивного чата.
+        chat_id: ID обрабатываемого чата.
+        count: Число сообщений в плане удаления.
     """
     # title = ""
     try:
@@ -3944,9 +4389,18 @@ async def _send_archive_header(
 async def _archive_chunk(
     app: Client, chat_id: ChatID, archive_target_id: ChatID, chunk: list[MessageID]
 ) -> bool:
-    """Архивирует батч (forward или copy). True — если ВЕСЬ батч успешно заархивирован.
+    """Архивирует батч (forward или copy) сообщений.
 
-    hide_sender_name применяется только при forward (copy и так без автора).
+    ``hide_sender_name`` применяется только при forward (copy и так без автора).
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID чата-источника.
+        archive_target_id: ID архивного чата.
+        chunk: Батч message_id.
+
+    Returns:
+        ``True``, только если ВЕСЬ батч успешно заархивирован.
     """
     try:
         if ARCHIVE_MODE == "copy":
@@ -3984,9 +4438,17 @@ async def _archive_and_delete_messages(
 ) -> None:
     """Архивирует (опц.) и пакетно удаляет сообщения из Telegram и БД.
 
-    Инвариант: батч удаляется только после успешной архивации (когда она включена
-    и ABORT_DELETE_ON_ARCHIVE_FAILURE=True). Из БД чистятся только реально
-    исчезнувшие из TG записи. Не коммитит — коммит в оркестраторе.
+    Инвариант: батч удаляется только после успешной архивации (когда она
+    включена и ``ABORT_DELETE_ON_ARCHIVE_FAILURE=True``). Из БД чистятся
+    только реально исчезнувшие из TG записи. Не коммитит — коммит
+    в оркестраторе.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID обрабатываемого чата.
+        conn: Соединение с БД.
+        tg_ids: Сообщения к удалению из Telegram.
+        archive_target_id: ID архивного чата или ``None``.
     """
     if not tg_ids:
         return
@@ -4053,7 +4515,13 @@ async def _archive_and_delete_messages(
 async def _delete_db_records(
     conn: aiosqlite.Connection, chat_id: ChatID, db_delete_ids: list[MessageID]
 ) -> None:
-    """Удаляет устаревшие записи из БД (сообщений уже нет в TG). Не коммитит."""
+    """Удаляет устаревшие записи из БД (сообщений уже нет в TG).
+
+    Args:
+        conn: Соединение с БД.
+        chat_id: ID чата.
+        db_delete_ids: message_id записей к удалению.
+    """
     if not db_delete_ids:
         return
     log.info(
@@ -4069,7 +4537,13 @@ async def _delete_db_records(
 async def _apply_db_updates(
     conn: aiosqlite.Connection, chat_id: ChatID, db_update_records: list[types.Message]
 ) -> None:
-    """Обновляет изменившиеся записи в БД. Не коммитит."""
+    """Обновляет изменившиеся записи в БД. Не коммитит.
+
+    Args:
+        conn: Соединение с БД.
+        chat_id: ID чата (для логов).
+        db_update_records: Актуальные объекты сообщений Telegram.
+    """
     if not db_update_records:
         return
     log.info(
@@ -4097,9 +4571,18 @@ async def handle_database_changes(
     db_update_records: list[types.Message],
     archive_target_id: ChatID | None = None,
 ) -> None:
-    """ЭТАП 3 (оркестратор): применяет изменения единой транзакцией.
+    """Оркестратор применения изменений единой транзакцией.
 
-    Под-функции НЕ коммитят — коммит делается здесь один раз.
+    Под-функции не коммитят — коммит делается здесь один раз.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID обрабатываемого чата.
+        conn: Соединение с БД.
+        tg_ids: Сообщения к удалению из Telegram.
+        db_delete_ids: Записи к удалению из БД.
+        db_update_records: Сообщения к обновлению в БД.
+        archive_target_id: ID архивного чата или ``None``.
     """
     if not any([tg_ids, db_delete_ids, db_update_records]):
         log.debug(f"Для чата {chat_label(chat_id)} нет запланированных изменений.")
@@ -4136,7 +4619,19 @@ async def process_single_chat(
     run_ts: str | None = None,
     archive_target_id: ChatID | None = None,
 ) -> None:
-    """Полный цикл обработки одного чата (синхронизация, отчеты, удаление дубликатов)."""
+    """Полный цикл обработки одного чата.
+
+    Синхронизация, отчёты и удаление дубликатов; ошибки одного чата
+    не прерывают обработку остальных.
+
+    Args:
+        app: Клиент Telegram.
+        chat_id: ID обрабатываемого чата.
+        me_id: ID текущего аккаунта.
+        args: Аргументы CLI.
+        run_ts: Общий таймстемп прогона для имён файлов отчётов.
+        archive_target_id: ID архивного чата, если архивация включена.
+    """
     if not await can_process_chat(app, chat_id, me_id, args):
         return
 
