@@ -105,7 +105,7 @@ GLOBAL_IGNORE_REGEX: Final[list[re.Pattern[str]]] = []
 CHAT_LABELS: dict[int, tuple[str, str | None]] = {}
 
 
-# region === TYPE DEFINITIONS (Python 3.12+) ===
+# region --- ТИПЫ И СТРУКТУРЫ ДАННЫХ (Python 3.12+) ---
 
 # Примитивы (для читаемости)
 type ChatID = int
@@ -2394,7 +2394,7 @@ async def sync_messages(
     """
     log.info(f"\n{'=' * 40}\nНачинаю синхронизацию чата {chat_label(chat_id)}")
 
-    # ── 1. Читаем состояние ──────────────────────────────────
+    # --- 1. Читаем состояние ---
     async with conn.execute(
         "SELECT is_fully_synced, newest_scanned_id FROM chat_sync_state WHERE chat_id = ?",
         (chat_id,),
@@ -2427,7 +2427,7 @@ async def sync_messages(
 
     LOG_INTERVAL = 5.0  # секунд между строками прогресса
 
-    # ── 2. Сканируем и пишем побатчево ───────────────────────
+    # --- 2. Сканируем и пишем побатчево ---
     try:
         for media_filter, filter_name in FILTERS_MAP.items():
             total_count = await _get_media_total(
@@ -2456,14 +2456,14 @@ async def sync_messages(
                 if audio_attrs:
                     batch.append((message.chat.id, message.id, *audio_attrs))
 
-                # ── батч заполнен → коммитим ─────────────────
+                # --- батч заполнен → коммитим ---
                 if len(batch) >= SYNC_BATCH_SIZE:
                     added = await _flush_audio_batch(conn, batch)
                     filter_added += added
                     total_added += added
                     batch.clear()
 
-                # ── периодический лог ────────────────────────
+                # --- периодический лог ---
                 now = time.monotonic()
                 if now - last_log_time >= LOG_INTERVAL:
                     progress = f" / {total_count}" if total_count else ""
@@ -2474,7 +2474,7 @@ async def sync_messages(
                     )
                     last_log_time = now
 
-            # ── остаток ──────────────────────────────────────
+            # --- остаток ---
             if batch:
                 added = await _flush_audio_batch(conn, batch)
                 filter_added += added
@@ -2483,7 +2483,7 @@ async def sync_messages(
 
             log.info(f"  {filter_name}: готово. Просмотрено {scanned}, добавлено {filter_added}")
 
-        # ── 3. Фиксируем курсор ─────────────────────────────
+        # --- 3. Фиксируем курсор ---
         await conn.execute(
             "INSERT OR REPLACE INTO chat_sync_state "
             "(chat_id, is_fully_synced, newest_scanned_id) "
@@ -2632,9 +2632,8 @@ def _group_audios_by_duplicates(all_audios: list[DBRow]) -> tuple[list[Duplicate
 
 
 # todo Вынести regex в конфиг
-# ─────────────────────────────────────────────────────────────
-# Регулярки — модульный уровень, компилируются один раз
-# ─────────────────────────────────────────────────────────────
+# region --- Регулярки ---
+# Компилируются один раз на уровне модуля.
 
 _DOMAINS = r"(?:net|com|ru|me|fm|tv|org|biz|info|cc|xyz|ua|by|kz|top|click|su|pm)"
 _MEDIA_EXT = (
@@ -2659,10 +2658,9 @@ _RE_META_PLACEHOLDER = re.compile(
 )
 # _RE_HASH_SUFFIX = re.compile(r"[\s_\-]+(?=[A-Z0-9]*\d)[A-Z0-9]{6}$")
 
+# endregion
 
-# ─────────────────────────────────────────────────────────────
-# Подфункции
-# ─────────────────────────────────────────────────────────────
+# region --- Подфункции fuzzy-матчера ---
 
 
 def _clean_filename(fname: str | None) -> str:
@@ -3106,7 +3104,7 @@ def _match_batch(
     current_meta_numbers = meta_numbers_cache[i]
     id_i = int(ids[i])
 
-    # ── cutoff (без изменений): penalty source-aware -> cutoff только ослабляется ──
+    # --- cutoff (без изменений): penalty source-aware -> cutoff только ослабляется ---
     if w_name > 0:
         min_name_powered_scores = (
             dynamic_thresholds[valid_indices_relative]
@@ -3141,7 +3139,7 @@ def _match_batch(
     dur_contrib = scores_dur[rel] * w_dur
     size_contrib = scores_size[rel] * w_size
 
-    # ── ЕДИНЫЙ cdist: строки = queries, столбцы = choices ──
+    # --- ЕДИНЫЙ cdist: строки = queries, столбцы = choices ---
     # queries:  [0]=имя тек., [1]=мета тек. (если есть)
     # choices:  [0:n]=имена кандидатов, [n:2n]=меты кандидатов (если есть)
     queries = [current_name]
@@ -3177,7 +3175,7 @@ def _match_batch(
     meta_src_rows = [p for p, s in enumerate(src_codes) if s in (_SRC_NM, _SRC_MM)]
     mask_phantoms = has_candidate_meta and bool(empty_meta_mask.any()) and meta_src_rows
 
-    # ── Stage 1: оптимистичный отбор (penalty=0 -> верхняя граница) ──
+    # --- Stage 1: оптимистичный отбор (penalty=0 -> верхняя граница) ---
     powered_stacked = (stacked / 100.0) ** name_power
     optimistic = powered_stacked * w_name  # (P, n)
     if mask_phantoms:
@@ -3192,7 +3190,7 @@ def _match_batch(
     surv_idx = np.flatnonzero(survive)  # позиции в массиве кандидатов
     surv_scores = stacked[:, surv_idx]  # (P, S)
 
-    # ── Stage 2: реальный penalty только для выживших ──
+    # --- Stage 2: реальный penalty только для выживших ---
     p_count = surv_scores.shape[0]
     penalty_stacked = np.zeros((p_count, surv_idx.size), dtype=np.float64)
     for col, s in enumerate(surv_idx.tolist()):
@@ -3381,9 +3379,9 @@ def _log_stats(
         log.info(f"Доля дубликатов: {duplicate_rate:.1f}%")
 
 
-# ─────────────────────────────────────────────────────────────
-# Оркестратор
-# ─────────────────────────────────────────────────────────────
+# endregion
+
+# region --- Оркестратор fuzzy-поиска ---
 
 
 def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[DuplicateGroup], EdgeMeta]:
@@ -3569,9 +3567,9 @@ def _group_audios_fuzzy_optimized(all_audios: list[DBRow]) -> tuple[list[Duplica
     return groups, edge_meta
 
 
-# ─────────────────────────────────────────────────────────────
-# Стратегия выбора оригинала (keep_priority)
-# ─────────────────────────────────────────────────────────────
+# endregion
+
+# region --- Стратегия выбора оригинала (keep_priority) ---
 
 
 class KeepCriterion(NamedTuple):
@@ -3680,6 +3678,9 @@ def _order_group_by_keep_priority(group: DuplicateGroup) -> list[DBRow]:
         ordered.append(winner)
         pool = [r for r in pool if r is not winner]
     return ordered
+
+
+# endregion
 
 
 async def _get_potential_duplicate_groups(
