@@ -32,6 +32,17 @@ dev = [
     "black>=26.5.1",
     "mypy>=2.3.0",
     "py-spy>=0.4.2",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "livedb: интеграционные тесты на копии живой БД music_library.sqlite (скип, если файла нет)",
 ]
 
 # main.py остаётся точкой входа репозитория (python main.py) и в пакет не ставится
@@ -58,6 +69,8 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "dedup/tcp_padded.py" = ["D", "UP006", "UP007", "UP035", "UP045"]
+# В тестах докстринги не требуются: имена тестов самодостаточны
+"tests/*" = ["D"]
 
 [tool.ruff.format]
 quote-style = "double"

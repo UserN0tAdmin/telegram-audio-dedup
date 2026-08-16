@@ -15,8 +15,6 @@ from .logger import log
 from .state import chat_label
 from .typedefs import ChatID, CsvRowFormatter, DBRow, RowFormatter
 
-# todo Поиск по всем чатам в БД с пониманием опечаток(--search)
-
 
 # todo ротация?
 def build_export_path(

@@ -2,8 +2,8 @@
 
 Точка входа приложения: загрузка конфигурации, инициализация окружения и
 оркестрация полного прогона дедупликации либо подкоманд CLI (``repair``,
-``report``, ``download``, ``export``). Прикладная логика вынесена в модули
-проекта; здесь только порядок её вызова.
+``report``, ``download``, ``export``, ``search``). Прикладная логика вынесена
+в модули проекта; здесь только порядок её вызова.
 """
 
 import asyncio
@@ -33,6 +33,7 @@ from dedup.exports import (
 )
 from dedup.logger import log, setup_logger
 from dedup.reports import create_duplicates_report
+from dedup.search import run_search
 from dedup.settings import load_config
 from dedup.state import chat_label
 from dedup.sync import sync_messages
@@ -135,6 +136,10 @@ async def main() -> None:
         export_func, done_message = export_actions[args.export_command]
         await export_func(args.chat)
         log.info(f"{done_message} Выход.")
+        return
+
+    if args.command == "search":
+        await run_search(args.query, args.min_score, args.wratio)
         return
 
     async with async_ipc_lock(settings.lock_file, timeout=settings.safety.lock_timeout):
