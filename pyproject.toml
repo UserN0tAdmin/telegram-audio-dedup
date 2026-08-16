@@ -17,9 +17,9 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 # Эти модули унифицируем отдельно (не в этой итерации)
-"config.py" = ["D", "I001", "W292"]
-"logger.py" = ["D", "I001", "W292"]
-"tcp_padded.py" = ["D", "UP006", "UP007", "UP035", "UP045"]
+"dedup/config.py" = ["D", "I001", "W292"]
+"dedup/logger.py" = ["D", "I001", "W292"]
+"dedup/tcp_padded.py" = ["D", "UP006", "UP007", "UP035", "UP045"]
 
 [tool.ruff.format]
 quote-style = "double"

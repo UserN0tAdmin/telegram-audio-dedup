@@ -5,9 +5,9 @@ import sys
 
 
 def setup_logger() -> logging.Logger:
-    from config import (LOG_LEVEL_CONSOLE, LOG_LEVEL_FILE,
-                        LOG_MAX_BYTES, LOG_BACKUP_COUNT,
-                        LOG_LEVEL_PYROGRAM, LOG_FILE_PATH)
+    from .config import (LOG_LEVEL_CONSOLE, LOG_LEVEL_FILE,
+                         LOG_MAX_BYTES, LOG_BACKUP_COUNT,
+                         LOG_LEVEL_PYROGRAM, LOG_FILE_PATH)
 
     # Создаем основной логгер
     logger = logging.getLogger('AudioDeleter')
@@ -20,7 +20,7 @@ def setup_logger() -> logging.Logger:
     # --- Обработчик для вывода в консоль ---
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(LOG_LEVEL_CONSOLE)
-    console_formatter = logging.Formatter('%(levelname)s [%(funcName)s]: %(message)s')
+    console_formatter = logging.Formatter('%(levelname)s [%(module)s.%(funcName)s]: %(message)s')
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
@@ -37,7 +37,7 @@ def setup_logger() -> logging.Logger:
     )
 
     file_handler.setLevel(LOG_LEVEL_FILE)
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s [%(funcName)s] - %(message)s')
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s [%(module)s.%(funcName)s] - %(message)s')
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
