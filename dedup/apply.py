@@ -243,6 +243,7 @@ async def _archive_and_delete_messages(
     )
 
     if archive_enabled:
+        # todo сделать отключаемым
         await _send_archive_header(app, archive_target_id, chat_id, len(tg_ids))
 
     batches = list(itertools.batched(tg_ids, cfg.performance.batch_delete_size))

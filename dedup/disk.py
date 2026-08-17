@@ -51,7 +51,7 @@ def _check_static_disk_space(path_to_check: Path, required_mb: float) -> bool:
             return False
 
         _, _, free_bytes = shutil.disk_usage(target_path)
-        log.info(
+        log.debug(
             f"Доступно на разделе '{target_path}': {format_bytes(free_bytes)}. Требуется: {required_mb:.2f} МБ."
         )
         if free_bytes < (required_mb * 1024**2):
@@ -98,9 +98,9 @@ async def _check_dynamic_disk_space() -> bool:
         target_path = get_existing_parent(backup_path)
         _, _, free_bytes = await asyncio.to_thread(shutil.disk_usage, target_path)
 
-        log.info(f"Текущий размер файлов проекта: {format_bytes(db_size + backups_size)}.")
-        log.info(f"  - Размер БД (с .wal/.shm): {format_bytes(db_size)}.")
-        log.info(f"  - Размер существующих бэкапов: {format_bytes(backups_size)}.")
+        log.debug(f"Текущий размер файлов проекта: {format_bytes(db_size + backups_size)}.")
+        log.debug(f"  - Размер БД (с .wal/.shm): {format_bytes(db_size)}.")
+        log.debug(f"  - Размер существующих бэкапов: {format_bytes(backups_size)}.")
         log.info(f"{log_reason} требуется ~{format_bytes(required_bytes)} свободного места.")
         log.info(f"Доступно на разделе '{target_path}': {format_bytes(free_bytes)}.")
 
