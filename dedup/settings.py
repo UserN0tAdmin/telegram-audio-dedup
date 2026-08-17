@@ -644,9 +644,9 @@ def load_config(
         matching_mode=mode_raw if mode_raw in ("set", "sort") else "sort",
         threshold=config.getfloat("fuzzy_matching", "threshold", fallback=0.90),
         max_duration_diff_sec=config.getint("fuzzy_matching", "max_duration_diff_sec", fallback=3),
-        name_power=config.getfloat("fuzzy_matching", "name_power", fallback=1.0),
-        duration_power=config.getfloat("fuzzy_matching", "duration_power", fallback=3.0),
-        size_power=config.getfloat("fuzzy_matching", "size_power", fallback=1.0),
+        name_power=config.getfloat("fuzzy_matching", "name_power", fallback=1.5),
+        duration_power=config.getfloat("fuzzy_matching", "duration_power", fallback=4.0),
+        size_power=config.getfloat("fuzzy_matching", "size_power", fallback=0.9),
         weight_name=config.getfloat("fuzzy_matching", "weight_name", fallback=0.50),
         weight_duration=config.getfloat("fuzzy_matching", "weight_duration", fallback=0.30),
         weight_size=config.getfloat("fuzzy_matching", "weight_size", fallback=0.20),
@@ -687,7 +687,7 @@ def load_config(
             1.1, config.getfloat("system_safety", "dynamic_space_coefficient", fallback=1.5)
         ),
         dynamic_space_safety_buffer_mb=config.getfloat(
-            "system_safety", "dynamic_space_safety_buffer_mb", fallback=16.0
+            "system_safety", "dynamic_space_safety_buffer_mb", fallback=8.0
         ),
     )
 
@@ -704,7 +704,7 @@ def load_config(
 
     # --- [backup] ---
     backup = BackupSettings(
-        backup_on_startup=config.getboolean("backup", "backup_on_startup", fallback=True),
+        backup_on_startup=config.getboolean("backup", "backup_on_startup", fallback=False),
         backup_only_if_changed=config.getboolean("backup", "backup_only_if_changed", fallback=True),
         rotate_before_backup=config.getboolean("backup", "rotate_before_backup", fallback=False),
         max_backups=config.getint("backup", "max_backups", fallback=1),
@@ -720,7 +720,7 @@ def load_config(
         log_level_pyrogram=config.get("logging", "log_level_pyrogram", fallback="WARNING"),
         log_max_bytes=config.getint("logging", "log_max_bytes", fallback=2097152),
         log_backup_count=config.getint("logging", "log_backup_count", fallback=5),
-        chat_label_parts=tuple(_get_list(config, "logging", "chat_label_parts", fallback="id")),
+        chat_label_parts=tuple(_get_list(config, "logging", "chat_label_parts", fallback="title, username, id")),
     )
 
     if errors:

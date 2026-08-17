@@ -272,7 +272,7 @@ def _bootstrap() -> None:
     try:
         settings = load_config(cli_overrides=collect_cli_overrides(args))
     except ConfigError as e:
-        print(f"ОШИБКА КОНФИГУРАЦИИ: {e}", file=sys.stderr)
+        print(f"{e}", file=sys.stderr)
         sys.exit(2)
 
     with secure_umask(0o077):
