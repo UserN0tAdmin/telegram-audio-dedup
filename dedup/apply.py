@@ -114,7 +114,7 @@ def _log_planned_changes(
         if archive_cfg.archive_before_delete and archive_target_id is not None:
             log.info(
                 f"Планируется {archive_cfg.archive_mode} {len(tg_ids)} сообщений из чата {chat_label(chat_id)} "
-                f"в архив {archive_target_id} перед удалением."
+                f"в архив {chat_label(archive_target_id)} перед удалением."
             )
         log.info(
             f"Планируется к удалению из Telegram в чате {chat_label(chat_id)} ({len(tg_ids)} шт.): {tg_ids}"

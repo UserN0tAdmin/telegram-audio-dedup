@@ -429,6 +429,7 @@ def _filter_already_connected(
         Отфильтрованные ``abs_indices``, ``valid_indices_relative`` и
         количество пропущенных кандидатов.
     """
+    # todo проверять также и имя файла, титле и перформер
     if not adjacency_i:
         return abs_indices, valid_indices_relative, 0
 
