@@ -108,6 +108,8 @@ python main.py report
 `python main.py report` и внимательный разбор групп — и только потом боевой
 прогон с `dry_run = False`.
 
+Пользуйтесь `[ignore_list]` и `[ignore_regex]`
+
 ## Лицензия
 
 Проект распространяется под лицензией [GPL-3.0](COPYING).
