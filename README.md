@@ -34,22 +34,15 @@
 # 1. Python 3.12+ и окружение
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e .
 
 # 2. Креды приложения Telegram (https://my.telegram.org)
-cat > .env <<EOF
-TG_API_ID=123456
-TG_API_HASH=0123456789abcdef0123456789abcdef
-EOF
+cp .env.example .env               # Windows: copy .env.example .env
+# → вписать в .env свои TG_API_ID и TG_API_HASH
 
-# 3. Минимальный config.cfg
-cat > config.cfg <<EOF
-[core]
-chat_list = -1001234567890, @some_music_chat
-
-[fuzzy_matching]
-enable = True
-EOF
+# 3. Конфиг из полностью прокомментированного шаблона
+cp config.example.cfg config.cfg   # Windows: copy config.example.cfg config.cfg
+# → минимум: указать в [core] свои чаты в chat_list
 
 # 4. Первый запуск: авторизация (создаст my_account.session) + синхронизация + отчёт
 python main.py report
@@ -58,7 +51,8 @@ python main.py report
 `report` ничего не удаляет: синхронизирует чаты в локальную БД и складывает
 в `exports/` наглядные отчёты о найденных дубликатах. Для боевого прогона
 остаётся выключить `dry_run` (он по умолчанию включён как страховка). Все
-остальные настройки имеют разумные дефолты; полный справочник —
+остальные настройки имеют разумные дефолты (подробно прокомментированы в самом
+`config.example.cfg`); полный справочник —
 [docs/configuration.md](docs/configuration.md).
 
 Подробнее про установку, прокси и первый вход: [docs/installation.md](docs/installation.md).
@@ -102,8 +96,9 @@ python main.py report
 - **БД**: SQLite (aiosqlite, WAL). Таблица `audios` хранит по одному ряду на
   аудиосообщение; `chat_sync_state` — курсоры инкрементальной синхронизации.
 - **Зависимости**: kurigram (форк pyrogram), rapidfuzz, numpy, aiosqlite,
-  openpyxl, fasteners, python-dotenv, uvloop/winloop. Полный список —
-  `pyproject.toml` (канонический манифест) и `requirements.txt` (точные пины).
+  openpyxl, fasteners, python-dotenv, uvloop/winloop. Единый манифест —
+  `pyproject.toml`: зависимости и dev-группа (pytest, ruff, mypy и т.п. —
+  `pip install --group dev`).
 - **Язык**: код, докстринги, логи и документация — на русском.
 
 ## Осторожно

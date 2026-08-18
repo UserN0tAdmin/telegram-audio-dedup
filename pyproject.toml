@@ -27,7 +27,6 @@ dependencies = [
 ]
 
 # Инструменты разработки; установка: pip install --group dev (pip >= 25.1)
-# либо pip install -r requirements-dev.txt
 [dependency-groups]
 dev = [
     "ruff>=0.15.20",

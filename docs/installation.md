@@ -12,13 +12,17 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
-`pyproject.toml` — канонический манифест зависимостей; `requirements.txt` — те
-же пакеты с точными пинами для воспроизводимости. Для разработки — 
-`pip install -r requirements-dev.txt` (pytest, ruff, mypy и т.п., см.
-[tests/README.md](../tests/README.md)).
+Все зависимости объявлены в едином манифесте `pyproject.toml`. Для
+разработки (pytest, ruff, mypy и т.п., см.
+[tests/README.md](../tests/README.md)):
+
+```bash
+python -m pip install -U pip       # нужен pip >= 25.1, если venv свежий со старым pip
+pip install --group dev
+```
 
 На Linux/macOS ставится `uvloop`, на Windows — `winloop`: скрипт подхватывает
 их автоматически для ускорения asyncio; если не установлены — работает и на
@@ -26,9 +30,19 @@ pip install -r requirements.txt
 
 ## Файлы конфигурации
 
-Нужны два файла в корне проекта (оба в `.gitignore`, secrets не утекут):
+Нужны два файла в корне проекта: `.env` и `config.cfg`. В репозитории лежат
+шаблоны без секретов — `.env.example` и `config.example.cfg` (они трекаются
+в git), рабочие копии создаются копированием (обе в `.gitignore`, secrets
+не утекут):
+
+```bash
+cp .env.example .env               # Windows: copy .env.example .env
+cp config.example.cfg config.cfg   # Windows: copy config.example.cfg config.cfg
+```
 
 ### `.env` — креды приложения
+
+Заполняется значениями с <https://my.telegram.org>:
 
 ```ini
 TG_API_ID=123456
@@ -42,8 +56,10 @@ TG_API_HASH=0123456789abcdef0123456789abcdef
 
 ### `config.cfg` — основная конфигурация
 
-Без него скрипт откажется стартовать (`ОШИБКА КОНФИГУРАЦИИ: Файл 'config.cfg'
-не найден`, код выхода 2). Минимум для старта:
+Проще всего начать с копии шаблона (см. выше) и поправить `chat_list` в
+`[core]`. Без файла скрипт откажется стартовать (`ОШИБКА КОНФИГУРАЦИИ: Файл
+'config.cfg' не найден`, код выхода 2); минимум для старта, если создаёшь
+конфиг с нуля:
 
 ```ini
 [core]
@@ -54,8 +70,8 @@ enable = True
 ```
 
 Все остальные опции имеют дефолты — полный справочник со значениями по
-умолчанию и рекомендациями: [configuration.md](configuration.md). Живой пример
-с подробными комментариями каждого параметра — в самом `config.cfg`.
+умолчанию и рекомендациями: [configuration.md](configuration.md). Подробно
+прокомментированный пример каждого параметра — `config.example.cfg`.
 
 Ошибка в конфиге не уронит прогон молча: все найденные проблемы (например,
 сумма весов fuzzy не равна 1.0, кривой regex, неизвестный критерий
@@ -130,7 +146,8 @@ proxy_url = https://t.me/proxy?server=example.com&port=443&secret=ee...
 ## Частые проблемы
 
 - **«Файл 'config.cfg' не найден»** — конфиг не создан или запущено не из
-  корня проекта. Скрипт ищет `config.cfg` в текущем каталоге.
+  корня проекта. Скрипт ищет `config.cfg` в текущем каталоге. Скопируй
+  `config.example.cfg` в `config.cfg` (см. [выше](#файлы-конфигурации)).
 - **`AlreadyRunningError` при старте** — вторая копия скрипта. Управляется
   `lock_timeout` в `[system_safety]`: `0` — сразу выйти, `-1` — ждать вечно.
 - **FloodWait** — Telegram ограничивает частоту запросов для активных
