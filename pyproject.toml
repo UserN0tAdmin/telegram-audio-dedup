@@ -1,11 +1,13 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dedup"
 version = "24.0.0"
 description = "Поиск и удаление дубликатов аудиофайлов в Telegram-чатах"
+license = "GPL-3.0-or-later"
+license-files = ["COPYING"]
 authors = [{ name = "UserN0tAdmin" }]
 requires-python = ">=3.12"
 dependencies = [
