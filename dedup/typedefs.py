@@ -87,7 +87,7 @@ def edge_key(a: MessageID, b: MessageID) -> EdgeKey:
 
 
 # Словари для верификации (ID сообщения -> Объект сообщения или Ошибка/None)
-type VerifiedMessagesDict = dict[MessageID, types.Message | None | Exception]
+type VerifiedMessagesDict = dict[MessageID, types.Message | Exception | None]
 
 
 # Результат классификации дубликатов

@@ -143,7 +143,7 @@ async def main(args: Namespace) -> None:
         return
 
     if args.command == "search":
-        await run_search(args.query, args.min_score, args.wratio)
+        await run_search(args.query, args.min_score, args.wratio, args.limit)
         return
 
     async with async_ipc_lock(settings.lock_file, timeout=settings.safety.lock_timeout):
@@ -285,7 +285,7 @@ def _bootstrap() -> None:
                 f"CLI-перекрытие: {section}.{option} = {new_value} (в конфиге: {old_value or '—'})"
             )
 
-        log.info(f"\n\n{('=+' * 60 + '\n') * 2}")
+        log.debug(f"\n\n{('=+' * 60 + '\n') * 2}")
         _install_event_loop()
 
         try:

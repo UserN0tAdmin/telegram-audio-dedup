@@ -3,8 +3,9 @@
 import logging
 
 from helpers import CHAT_ID, make_row
+from wcwidth import wcswidth
 
-from dedup.search import _RESULT_LIMIT, SCORE_CUTOFF, rank_rows, run_search
+from dedup.search import RESULT_LIMIT, SCORE_CUTOFF, _format_results, rank_rows, run_search
 
 
 def test_rank_rows_exact_match_scores_100():
@@ -80,10 +81,18 @@ def test_rank_rows_filters_irrelevant():
 def test_rank_rows_limited_to_result_limit():
     # Одинаковые имена в разных чатах: все выше порога, но вывод ограничен
     rows = [
-        make_row(i, "Same Song.mp3", 1_000_000, 100, chat_id=CHAT_ID + i) for i in range(1, 30)
+        make_row(i, "Same Song.mp3", 1_000_000, 100, chat_id=CHAT_ID + i)
+        for i in range(1, RESULT_LIMIT + 20)
     ]
     results = rank_rows("same song", rows)
-    assert len(results) == _RESULT_LIMIT
+    assert len(results) == RESULT_LIMIT
+
+
+def test_rank_rows_result_limit_parameter():
+    # Лимит можно перекрыть: результат обрезается даже при большом числе совпадений
+    rows = [make_row(i, "Same Song.mp3", 1_000_000, 100, chat_id=CHAT_ID + i) for i in range(1, 10)]
+    assert len(rank_rows("same song", rows, result_limit=3)) == 3
+    assert len(rank_rows("same song", rows, result_limit=100)) == 9
 
 
 def test_rank_rows_exact_match_ranks_first():
@@ -127,3 +136,40 @@ async def test_run_search_no_results(seeded_db, caplog):
         await run_search("zzzzz qqqqqq")
     text = "\n".join(r.message for r in caplog.records)
     assert "совпадений: 0" in text
+
+
+def test_format_results_aligns_columns():
+    # Колонки добиваются до самой широкой строки: визуальная ширина префикса
+    # до ссылки одинакова у всех строк (wcswidth, как в прод-коде)
+    rows = [
+        make_row(1, "Short.mp3", 1_000_000, 100),
+        make_row(2, "A Considerably Longer File Name.flac", 5_000_000_000, 7_200),
+    ]
+    lines = _format_results([(95, rows[0]), (72, rows[1])])
+    prefix_widths = {wcswidth(line[: line.index("https://t.me/")]) for line in lines}
+    assert len(prefix_widths) == 1
+
+
+def test_format_results_pads_wide_chars_like_plain():
+    # Кириллица и латиница одной «визуальной» длины дают одинаковое смещение ссылки
+    rows = [
+        make_row(1, "Песня о свободе.mp3", 1_000_000, 100),
+        make_row(2, "Pesnya o svobode.mp3", 1_000_000, 100),
+    ]
+    lines = _format_results([(90, rows[0]), (80, rows[1])])
+    offsets = {line.index("https://t.me/") for line in lines}
+    assert len(offsets) == 1
+
+
+def test_format_results_drops_all_empty_size_column():
+    # file_size = 0 у всех строк — колонка размера не выводится вовсе
+    rows = [make_row(1, "Song One.mp3", 0, 100), make_row(2, "Song Two.mp3", 0, 100)]
+    lines = _format_results([(90, rows[0]), (80, rows[1])])
+    assert all("MiB" not in line and "B |" not in line for line in lines)
+    assert all("https://t.me/c/" in line for line in lines)
+
+
+def test_format_results_keeps_link_without_100_prefix():
+    rows = [make_row(1, "Song.mp3", 1_000_000, 100)]
+    (line,) = _format_results([(88, rows[0])])
+    assert "https://t.me/c/1234567890/1" in line  # -100 из chat_id убран

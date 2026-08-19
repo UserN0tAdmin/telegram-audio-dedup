@@ -4,7 +4,7 @@ import argparse
 from argparse import Namespace
 
 from .errors import ConfigError
-from .search import SCORE_CUTOFF
+from .search import RESULT_LIMIT, SCORE_CUTOFF
 from .state import chat_id_or_username
 
 
@@ -29,6 +29,27 @@ def min_score(value: str) -> int:
     if not 0 <= score <= 100:
         raise argparse.ArgumentTypeError(f"порог должен быть в диапазоне 0..100, получено {score}")
     return score
+
+
+def positive_int(value: str) -> int:
+    """Type-функция argparse: целое >= 1 — лимит результатов для ``--limit``.
+
+    Args:
+        value: Сырая строка из командной строки.
+
+    Returns:
+        Положительное целое.
+
+    Raises:
+        argparse.ArgumentTypeError: Если значение не целое или меньше 1.
+    """
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"ожидается целое число, получено '{value}'") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"ожидается целое число >= 1, получено {number}")
+    return number
 
 
 def fuzzy_threshold(value: str) -> float:
@@ -212,6 +233,13 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Скорер WRatio вместо token_set_ratio: ловит короткие обрывки с опечатками, "
         "но шкала сжата (слово найдено = 90) — учтите в --min-score.",
+    )
+    p_search.add_argument(
+        "--limit",
+        type=positive_int,
+        default=RESULT_LIMIT,
+        metavar="N",
+        help=f"Максимум результатов в выдаче (по умолчанию {RESULT_LIMIT}).",
     )
 
     p_export = add_subcommand(

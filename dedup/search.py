@@ -12,6 +12,7 @@ from typing import Final
 import aiosqlite
 import numpy as np
 from rapidfuzz import fuzz, process
+from wcwidth import wcswidth
 
 from .context import get_settings
 from .fuzzy import clean_filename, clean_meta, process_for_fuzzy
@@ -21,12 +22,16 @@ from .typedefs import DBRow
 from .utils import format_bytes, format_duration
 
 # Минимальная схожесть (0..100) и максимум выводимых результатов.
-SCORE_CUTOFF: Final[float] = 70.0
-_RESULT_LIMIT: Final[int] = 20
+SCORE_CUTOFF: Final[float] = 50.0
+RESULT_LIMIT: Final[int] = 200
 
 
 def rank_rows(
-    query: str, rows: list[DBRow], score_cutoff: float = SCORE_CUTOFF, wratio: bool = False
+    query: str,
+    rows: list[DBRow],
+    score_cutoff: float = SCORE_CUTOFF,
+    wratio: bool = False,
+    result_limit: int = RESULT_LIMIT,
 ) -> list[tuple[int, DBRow]]:
     """Ранжирует строки таблицы ``audios`` по схожести с запросом.
 
@@ -43,9 +48,10 @@ def rank_rows(
         rows: Строки таблицы ``audios``.
         score_cutoff: Минимальная схожесть (0..100) для попадания в выдачу.
         wratio: Использовать WRatio вместо ``token_set_ratio``.
+        result_limit: Максимум результатов в выдаче.
 
     Returns:
-        Не более ``_RESULT_LIMIT`` пар ``(score, row)`` со схожестью
+        Не более ``result_limit`` пар ``(score, row)`` со схожестью
         не ниже ``score_cutoff``, по убыванию score.
     """
     q = process_for_fuzzy(query)
@@ -90,24 +96,76 @@ def rank_rows(
         key=lambda pair: pair[0],
         reverse=True,
     )
-    return ranked[:_RESULT_LIMIT]
+    return ranked[: max(result_limit, 0)]
 
 
-def _format_result(score: int, row: DBRow) -> str:
-    """Форматирует одну строку результата для вывода в консоль."""
-    title = row["file_name"] or " ".join(
-        filter(None, (row["performer"], "-", row["title"]))
-    ).strip(" -") or "<без имени>"
-    duration = format_duration(row["duration"])
-    size = format_bytes(row["file_size"]) if row["file_size"] else ""
-    public_chat_id = str(row["chat_id"]).removeprefix("-100")
-    link = f"https://t.me/c/{public_chat_id}/{row['message_id']}"
-    parts = (f"[{score}%] {title}", duration, size, chat_label(row["chat_id"]), link)
-    return " | ".join(p for p in parts if p)
+def _visual_width(text: str) -> int:
+    """Визуальная ширина строки в клетках консоли (широкий символ = 2).
+
+    ``wcswidth`` возвращает ``-1`` на управляющих символах — тогда фолбэк
+    на длину строки, как в экспорте имён со ссылками.
+    """
+    width = wcswidth(text)
+    return width if width >= 0 else len(text)
+
+
+def _pad(text: str, width: int) -> str:
+    """Добивает строку пробелами до визуальной ширины ``width``."""
+    return text + " " * (width - _visual_width(text))
+
+
+def _format_results(results: list[tuple[int, DBRow]]) -> list[str]:
+    """Форматирует строки результата для вывода в консоль.
+
+    Выравнивание как в экспорте ``filenames-url``: каждая колонка (имя,
+    длительность, размер, чат) добивается пробелами до самой широкой строки
+    результата с учётом визуальной ширины символов. Колонка, пустая во всех
+    строках (например, нет размера), не выводится.
+    """
+    cells: list[tuple[int, str, str, str, str, str]] = []
+    for score, row in results:
+        title = (
+            row["file_name"]
+            or " ".join(filter(None, (row["performer"], "-", row["title"]))).strip(" -")
+            or "<без имени>"
+        )
+        size = format_bytes(row["file_size"]) if row["file_size"] else ""
+        public_chat_id = str(row["chat_id"]).removeprefix("-100")
+        cells.append(
+            (
+                score,
+                title,
+                format_duration(row["duration"]),
+                size,
+                chat_label(row["chat_id"]),
+                f"https://t.me/c/{public_chat_id}/{row['message_id']}",
+            )
+        )
+
+    widths = [
+        max((_visual_width(c[1]) for c in cells), default=0),  # имя
+        max((_visual_width(c[2]) for c in cells), default=0),  # длительность
+        max((_visual_width(c[3]) for c in cells), default=0),  # размер
+        max((_visual_width(c[4]) for c in cells), default=0),  # чат
+    ]
+    has_size = any(c[3] for c in cells)
+
+    lines = []
+    for score, title, duration, size, chat, link in cells:
+        parts = [f"[{score:>3}%] {_pad(title, widths[0])}", _pad(duration, widths[1])]
+        if has_size:
+            parts.append(_pad(size, widths[2]))
+        parts.append(_pad(chat, widths[3]))
+        parts.append(link)
+        lines.append(" | ".join(parts))
+    return lines
 
 
 async def run_search(
-    query: str, score_cutoff: float = SCORE_CUTOFF, wratio: bool = False
+    query: str,
+    score_cutoff: float = SCORE_CUTOFF,
+    wratio: bool = False,
+    result_limit: int = RESULT_LIMIT,
 ) -> None:
     """Выполняет нечёткий поиск по всем чатам в БД и печатает результаты.
 
@@ -117,6 +175,7 @@ async def run_search(
         query: Поисковый запрос пользователя.
         score_cutoff: Минимальная схожесть (0..100) для попадания в выдачу.
         wratio: Использовать WRatio вместо ``token_set_ratio``.
+        result_limit: Максимум результатов в выдаче.
     """
     db_file = get_settings().paths.db_file
     try:
@@ -133,10 +192,12 @@ async def run_search(
             log.warning("База данных не содержит аудиозаписей.")
             return
 
-        results = await asyncio.to_thread(rank_rows, query, rows, score_cutoff, wratio)
+        results = await asyncio.to_thread(
+            rank_rows, query, rows, score_cutoff, wratio, result_limit
+        )
         log.info(f"Просмотрено {len(rows)} аудио; совпадений: {len(results)}.")
-        for score, row in results:
-            log.info(_format_result(score, row))
+        for line in _format_results(results):
+            log.info(line)
 
     except aiosqlite.Error as e:
         log.critical(f"Произошла ошибка SQLite при поиске: {e}")

@@ -4,6 +4,7 @@ import pytest
 
 from dedup.cli import collect_cli_overrides, parse_arguments
 from dedup.errors import ConfigError
+from dedup.search import RESULT_LIMIT, SCORE_CUTOFF
 
 
 def parse(argv, monkeypatch):
@@ -29,8 +30,8 @@ def test_search_requires_query(monkeypatch):
     assert excinfo.value.code == 2
 
 
-def test_search_min_score_defaults_to_70(monkeypatch):
-    assert parse(["search", "q"], monkeypatch).min_score == 70
+def test_search_min_score_defaults_to_score_cutoff(monkeypatch):
+    assert parse(["search", "q"], monkeypatch).min_score == int(SCORE_CUTOFF)
 
 
 def test_search_min_score_accepts_custom_value(monkeypatch):
@@ -41,6 +42,23 @@ def test_search_min_score_accepts_custom_value(monkeypatch):
 def test_search_wratio_flag(monkeypatch):
     assert parse(["search", "q"], monkeypatch).wratio is False
     assert parse(["search", "q", "--wratio"], monkeypatch).wratio is True
+
+
+def test_search_limit_defaults_to_result_limit(monkeypatch):
+    assert parse(["search", "q"], monkeypatch).limit == RESULT_LIMIT
+
+
+def test_search_limit_accepts_custom_value(monkeypatch):
+    args = parse(["search", "q", "--limit", "5"], monkeypatch)
+    assert args.limit == 5
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+def test_search_limit_rejects_non_positive(bad, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["prog", "search", "q", "--limit", bad])
+    with pytest.raises(SystemExit) as excinfo:
+        parse_arguments()
+    assert excinfo.value.code == 2
 
 
 @pytest.mark.parametrize("bad", ["-1", "101", "abc"])

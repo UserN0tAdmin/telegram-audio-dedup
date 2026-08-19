@@ -720,7 +720,9 @@ def load_config(
         log_level_pyrogram=config.get("logging", "log_level_pyrogram", fallback="WARNING"),
         log_max_bytes=config.getint("logging", "log_max_bytes", fallback=2097152),
         log_backup_count=config.getint("logging", "log_backup_count", fallback=5),
-        chat_label_parts=tuple(_get_list(config, "logging", "chat_label_parts", fallback="title, username, id")),
+        chat_label_parts=tuple(
+            _get_list(config, "logging", "chat_label_parts", fallback="title, username, id")
+        ),
     )
 
     if errors:
