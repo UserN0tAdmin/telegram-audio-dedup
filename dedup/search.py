@@ -7,7 +7,7 @@
 
 import asyncio
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 import aiosqlite
 import numpy as np
@@ -32,7 +32,7 @@ def rank_rows(
     score_cutoff: float = SCORE_CUTOFF,
     wratio: bool = False,
     result_limit: int = RESULT_LIMIT,
-) -> list[tuple[int, DBRow]]:
+) -> list[tuple[float, DBRow]]:
     """Ранжирует строки таблицы ``audios`` по схожести с запросом.
 
     Каждая строка представлена двумя вариантами текста — очищенным именем
@@ -92,7 +92,7 @@ def rank_rows(
             best[row_i] = float(score)
 
     ranked = sorted(
-        ((int(score), rows[row_i]) for row_i, score in best.items()),
+        ((score, rows[row_i]) for row_i, score in best.items()),
         key=lambda pair: pair[0],
         reverse=True,
     )
@@ -114,7 +114,58 @@ def _pad(text: str, width: int) -> str:
     return text + " " * (width - _visual_width(text))
 
 
-def _format_results(results: list[tuple[int, DBRow]]) -> list[str]:
+class _ResultRow(NamedTuple):
+    """Одна строка результата, уже приведённая к отображаемому виду.
+
+    Все поля, кроме ``score``, уже отформатированы под вывод в консоль
+    (см. ``_row_from_db``) и не требуют дальнейшей обработки.
+
+    Attributes:
+        score: Схожесть с запросом (0..100), как вернул ``rank_rows``.
+        title: Имя файла, либо ``"исполнитель - трек"`` из метаданных,
+            либо ``"<без имени>"``, если и то и другое пусто.
+        duration: Длительность, отформатированная ``format_duration``.
+        size: Размер файла, отформатированный ``format_bytes``; пустая
+            строка, если размер неизвестен.
+        chat: Человекочитаемая метка чата (``chat_label``).
+        link: Прямая ссылка на сообщение в Telegram (``t.me/c/...``).
+    """
+
+    score: float
+    title: str
+    duration: str
+    size: str
+    chat: str
+    link: str
+
+
+def _row_from_db(score: float, row: DBRow) -> _ResultRow:
+    title = (
+        row["file_name"]
+        or " ".join(filter(None, (row["performer"], "-", row["title"]))).strip(" -")
+        or "<без имени>"
+    )
+    public_chat_id = str(row["chat_id"]).removeprefix("-100")
+    return _ResultRow(
+        score=score,
+        title=title,
+        duration=format_duration(row["duration"]),
+        size=format_bytes(row["file_size"]) if row["file_size"] else "",
+        chat=chat_label(row["chat_id"]),
+        link=f"https://t.me/c/{public_chat_id}/{row['message_id']}",
+    )
+
+
+# Колонки между именем и ссылкой, в порядке вывода. Поля из
+# _OPTIONAL_MIDDLE_FIELDS скрываются целиком, если пусты у всех строк
+# (как сейчас происходит с size). Чтобы добавить колонку: (1) поле в
+# _ResultRow, (2) заполнить его в _row_from_db, (3) добавить сюда —
+# индексы нигде больше трогать не нужно.
+_MIDDLE_FIELDS: Final[tuple[str, ...]] = ("duration", "size", "chat")
+_OPTIONAL_MIDDLE_FIELDS: Final[frozenset[str]] = frozenset({"size"})
+
+
+def _format_results(results: list[tuple[float, DBRow]]) -> list[str]:
     """Форматирует строки результата для вывода в консоль.
 
     Выравнивание как в экспорте ``filenames-url``: каждая колонка (имя,
@@ -122,41 +173,24 @@ def _format_results(results: list[tuple[int, DBRow]]) -> list[str]:
     результата с учётом визуальной ширины символов. Колонка, пустая во всех
     строках (например, нет размера), не выводится.
     """
-    cells: list[tuple[int, str, str, str, str, str]] = []
-    for score, row in results:
-        title = (
-            row["file_name"]
-            or " ".join(filter(None, (row["performer"], "-", row["title"]))).strip(" -")
-            or "<без имени>"
-        )
-        size = format_bytes(row["file_size"]) if row["file_size"] else ""
-        public_chat_id = str(row["chat_id"]).removeprefix("-100")
-        cells.append(
-            (
-                score,
-                title,
-                format_duration(row["duration"]),
-                size,
-                chat_label(row["chat_id"]),
-                f"https://t.me/c/{public_chat_id}/{row['message_id']}",
-            )
-        )
+    rows = [_row_from_db(score, row) for score, row in results]
 
-    widths = [
-        max((_visual_width(c[1]) for c in cells), default=0),  # имя
-        max((_visual_width(c[2]) for c in cells), default=0),  # длительность
-        max((_visual_width(c[3]) for c in cells), default=0),  # размер
-        max((_visual_width(c[4]) for c in cells), default=0),  # чат
+    title_width = max((_visual_width(r.title) for r in rows), default=0)
+    widths = {
+        field: max((_visual_width(getattr(r, field)) for r in rows), default=0)
+        for field in _MIDDLE_FIELDS
+    }
+    visible_fields = [
+        field
+        for field in _MIDDLE_FIELDS
+        if field not in _OPTIONAL_MIDDLE_FIELDS or any(getattr(r, field) for r in rows)
     ]
-    has_size = any(c[3] for c in cells)
 
     lines = []
-    for score, title, duration, size, chat, link in cells:
-        parts = [f"[{score:>3}%] {_pad(title, widths[0])}", _pad(duration, widths[1])]
-        if has_size:
-            parts.append(_pad(size, widths[2]))
-        parts.append(_pad(chat, widths[3]))
-        parts.append(link)
+    for r in rows:
+        parts = [f"[{r.score:>5.1f}%] {_pad(r.title, title_width)}"]
+        parts += [_pad(getattr(r, field), widths[field]) for field in visible_fields]
+        parts.append(r.link)
         lines.append(" | ".join(parts))
     return lines
 
