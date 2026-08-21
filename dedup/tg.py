@@ -11,7 +11,7 @@ from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_
 
 # Используется kurigram
 from pyrogram import Client, types
-from pyrogram.connection.transport.tcp import TCPAbridged
+from pyrogram.connection.transport.tcp import TCPAbridged, TCPIntermediatePadded
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import (
     PeerIdInvalid,
@@ -24,7 +24,6 @@ from .context import get_settings
 from .errors import IgnoreListResolutionError
 from .logger import log
 from .state import GLOBAL_IGNORE_REGEX, IGNORE_MESSAGES, IGNORE_REGEX, chat_label, remember_chat
-from .tcp_padded import TCPPadded
 from .typedefs import AudioMeta, ChatID, MessageID
 
 # Самый большой блок, содержащий всю "умную" часть скрипта: получение сообщений из Telegram, их анализ, поиск дубликатов и выполнение действий.
@@ -52,8 +51,8 @@ async def create_telegram_client() -> Client | None:
             try:
                 local_port = await start_local_bridge(p.proxy_url)
                 transport = (
-                    TCPPadded if needs_padded_transport(p.proxy_url) else TCPAbridged
-                )  # todo TCPIntermediatePadded
+                    TCPIntermediatePadded if needs_padded_transport(p.proxy_url) else TCPAbridged
+                )
                 client_kwargs["proxy"] = {
                     "scheme": "socks5",
                     "hostname": "127.0.0.1",
