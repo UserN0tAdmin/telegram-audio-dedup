@@ -163,6 +163,24 @@ async def test_admin_without_delete_rights_denied_in_full_run(configure_settings
     assert await can_process_chat(client, CHAT, ME_ID, read_only_args()) is True
 
 
+async def test_sync_command_counts_as_read_only(configure_settings):
+    # sync ничего не удаляет: права на удаление не нужны даже в боевом конфиге,
+    # а не-участник может синхронизировать публичный чат
+    configure_settings(core={"dry_run": False})
+    client = FakeClient()
+    client.chats[CHAT] = make_chat(CHAT)
+    client.members[(CHAT, ME_ID)] = make_member(
+        ChatMemberStatus.ADMINISTRATOR,
+        privileges=SimpleNamespace(can_delete_messages=False),
+    )
+    assert await can_process_chat(client, CHAT, ME_ID, read_only_args("sync")) is True
+
+    public = FakeClient()
+    public.chats[CHAT] = make_chat(CHAT, username="public_chan")
+    public.members[(CHAT, ME_ID)] = UserNotParticipant("не участник")
+    assert await can_process_chat(public, CHAT, ME_ID, read_only_args("sync")) is True
+
+
 async def test_owner_allowed(configure_settings):
     configure_settings(core={"dry_run": False})
     client = FakeClient()

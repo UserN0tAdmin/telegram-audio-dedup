@@ -181,6 +181,9 @@ async def main(args: Namespace) -> None:
 
         async with app:
             me = app.me
+            if me is None:
+                log.critical("Не удалось получить информацию о текущем аккаунте.")
+                return
 
             if args.command == "download":
                 resolved_ids = await resolve_chat_identifiers(app, [args.chat])
@@ -197,6 +200,34 @@ async def main(args: Namespace) -> None:
                     return
 
                 await download_chat_audio(app, target_chat_id)
+                log.info("Работа завершена. Выход.")
+                return
+
+            if args.command == "sync":
+                identifiers = [args.chat] if args.chat else settings.core.chat_list
+                if not identifiers:
+                    log.error(
+                        "Нечего синхронизировать: чат не указан, а core.chat_list пуст."
+                    )
+                    return
+
+                resolved_ids = await resolve_chat_identifiers(app, identifiers)
+                if args.chat and not resolved_ids:
+                    log.error(f"Не удалось найти чат по идентификатору: {args.chat}")
+                    return
+
+                for chat_id in resolved_ids:
+                    try:
+                        if not await can_process_chat(app, chat_id, me.id, args):
+                            continue
+                        # NOTE: Соединение на каждый чат — как в process_single_chat.
+                        async with create_connection() as conn:
+                            await sync_messages(app, chat_id, conn, force=args.force)
+                    except Exception as e:
+                        log.error(
+                            f"Синхронизация чата {chat_label(chat_id)} не удалась "
+                            f"(остальные чаты обрабатываются дальше): {e}"
+                        )
                 log.info("Работа завершена. Выход.")
                 return
 

@@ -63,6 +63,7 @@ python main.py report
 |---|---|
 | `python main.py` | Полный прогон: синхронизация → поиск дубликатов → (архивация →) удаление по `chat_list` |
 | `python main.py report` | Отчёт о группах дубликатов со ссылками `t.me`, без удаления |
+| `python main.py sync [чат] [--force]` | Только синхронизация (все чаты из `chat_list` или один); `--force` — полный перескан |
 | `python main.py repair` | Ремонт и оптимизация БД (сверка битых записей с Telegram, VACUUM) |
 | `python main.py download <чат>` | Скачать все аудио чата в `downloads/<chat_id>/` |
 | `python main.py export filenames <чат>` | Имена файлов из БД в txt |

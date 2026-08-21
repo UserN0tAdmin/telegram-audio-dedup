@@ -65,6 +65,8 @@ async def sync_messages(
     app: Client,
     chat_id: ChatID,
     conn: aiosqlite.Connection,
+    *,
+    force: bool = False,
 ) -> None:
     """Синхронизация: поиск AUDIO + DOCUMENT на серверах Telegram.
 
@@ -75,6 +77,8 @@ async def sync_messages(
         app: Клиент Telegram.
         chat_id: ID синхронизируемого чата.
         conn: Соединение с БД.
+        force: Полный перескан с нуля вместо инкрементального режима
+            (курсор игнорируется, существующие строки сохраняются).
 
     Raises:
         Exception: Любая ошибка синхронизации — транзакция откатывается
@@ -102,7 +106,10 @@ async def sync_messages(
     total_added = 0
 
     search_kwargs: dict[str, Any] = {}
-    is_incremental = is_fully_synced and db_newest_id > 0
+    is_incremental = is_fully_synced and db_newest_id > 0 and not force
+
+    if force:
+        log.info("Флаг --force: полный перескан, курсор игнорируется")
 
     if is_incremental:
         search_kwargs["min_id"] = db_newest_id

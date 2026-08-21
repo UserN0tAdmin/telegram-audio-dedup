@@ -81,6 +81,24 @@ def test_download_takes_raw_string_identifier(monkeypatch):
     assert parse(["download", "-1001234567890"], monkeypatch).chat == "-1001234567890"
 
 
+def test_sync_defaults_to_chat_list_without_force(monkeypatch):
+    args = parse(["sync"], monkeypatch)
+    assert args.command == "sync"
+    assert args.chat is None
+    assert args.force is False
+
+
+def test_sync_takes_optional_raw_chat(monkeypatch):
+    assert parse(["sync", "@music"], monkeypatch).chat == "@music"
+    assert parse(["sync", "-1001234567890"], monkeypatch).chat == "-1001234567890"
+
+
+def test_sync_force_flag(monkeypatch):
+    assert parse(["sync"], monkeypatch).force is False
+    assert parse(["sync", "--force"], monkeypatch).force is True
+    assert parse(["sync", "@music", "--force"], monkeypatch).force is True
+
+
 def test_export_filenames_with_numeric_chat(monkeypatch):
     args = parse(["export", "filenames", "123"], monkeypatch)
     assert args.command == "export"
@@ -182,6 +200,12 @@ def test_chat_flag(monkeypatch):
 
 def test_download_positional_chat_not_confused_with_override(monkeypatch):
     args = parse(["--chat", "@outer", "download", "@inner"], monkeypatch)
+    assert args.chat == "@inner"
+    assert collect_cli_overrides(args)[("core", "chat_list")] == "@outer"
+
+
+def test_sync_positional_chat_not_confused_with_override(monkeypatch):
+    args = parse(["--chat", "@outer", "sync", "@inner"], monkeypatch)
     assert args.chat == "@inner"
     assert collect_cli_overrides(args)[("core", "chat_list")] == "@outer"
 

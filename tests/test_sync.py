@@ -98,3 +98,45 @@ async def test_sync_messages_is_idempotent(fresh_db):
 
     async with fresh_db.execute("SELECT COUNT(*) FROM audios") as c:
         assert (await c.fetchone())[0] == 4  # дублей не появилось
+
+
+async def test_sync_messages_force_ignores_cursor_and_keeps_rows(fresh_db):
+    await fresh_db.execute("INSERT INTO chat_sync_state VALUES (?, 1, 3)", (CHAT_ID,))
+    # Строка из прошлого прогона: PK (chat_id, message_id) совпадает с message 1
+    await fresh_db.execute(
+        "INSERT INTO audios VALUES (?, 1, 'S1', 'song1.mp3', 1000, 101, 'Perf', 'Title')",
+        (CHAT_ID,),
+    )
+    await fresh_db.commit()
+
+    client = FakeClient()
+    client.history = build_history()
+    await sync_messages(client, CHAT_ID, fresh_db, force=True)
+
+    # Перескан шёл без min_id, несмотря на сохранённый курсор
+    search_calls = client.calls["search_messages"]
+    assert len(search_calls) == 2
+    for _, kwargs in search_calls:
+        assert "min_id" not in kwargs
+
+    # Существующая строка не задвоилась (INSERT OR IGNORE), курсор пересчитан
+    async with fresh_db.execute("SELECT COUNT(*) FROM audios") as c:
+        assert (await c.fetchone())[0] == 4
+    async with fresh_db.execute(
+        "SELECT is_fully_synced, newest_scanned_id FROM chat_sync_state WHERE chat_id = ?",
+        (CHAT_ID,),
+    ) as c:
+        synced, newest = await c.fetchone()
+    assert synced == 1
+    assert newest == 6
+
+
+async def test_sync_messages_force_on_virgin_database_is_full_scan(fresh_db):
+    client = FakeClient()
+    client.history = build_history()
+    await sync_messages(client, CHAT_ID, fresh_db, force=True)
+
+    async with fresh_db.execute("SELECT COUNT(*) FROM audios") as c:
+        assert (await c.fetchone())[0] == 4
+    for _, kwargs in client.calls["search_messages"]:
+        assert "min_id" not in kwargs

@@ -1,4 +1,4 @@
-"""Разбор аргументов командной строки (подкоманды repair/report/download/export/search)."""
+"""Разбор аргументов командной строки (подкоманды repair/report/sync/download/export/search)."""
 
 import argparse
 from argparse import Namespace
@@ -173,9 +173,9 @@ def collect_cli_overrides(args: Namespace) -> dict[tuple[str, str], str]:
 def parse_arguments() -> argparse.Namespace:
     """Настраивает и парсит аргументы командной строки.
 
-    Подкоманды: ``repair``, ``report``, ``download``, ``export``, ``search``.
-    Вызов без подкоманды — обычный прогон дедупликации. Глобальные флаги
-    перекрытия конфигурации (``--set``/``--dry-run``/``--chat``/
+    Подкоманды: ``repair``, ``report``, ``sync``, ``download``, ``export``,
+    ``search``. Вызов без подкоманды — обычный прогон дедупликации. Глобальные
+    флаги перекрытия конфигурации (``--set``/``--dry-run``/``--chat``/
     ``--threshold``) принимаются до и после подкоманды.
 
     Returns:
@@ -210,6 +210,24 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         metavar="CHAT_IDENTIFIER",
         help="Идентификатор чата (ID, @username или ссылка).",
+    )
+
+    p_sync = add_subcommand(
+        "sync",
+        "Синхронизирует метаданные аудио чатов в локальную БД (без поиска дубликатов и удаления).",
+    )
+    p_sync.add_argument(
+        "chat",
+        type=str,
+        metavar="CHAT_IDENTIFIER",
+        nargs="?",
+        default=None,
+        help="Один чат (ID, @username или ссылка); без аргумента — все чаты из core.chat_list.",
+    )
+    p_sync.add_argument(
+        "--force",
+        action="store_true",
+        help="Полный перескан чата вместо инкрементального (курсор синхронизации игнорируется).",
     )
 
     p_search = add_subcommand(
