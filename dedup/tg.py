@@ -334,7 +334,9 @@ async def can_process_chat(app: Client, chat_id: ChatID, me_id: int, args: Names
 
         # 1. Определяем режим работы
         core = get_settings().core
-        is_read_only = args.command in ("report", "download", "sync") or core.dry_run or core.report_only
+        is_read_only = (
+            args.command in ("report", "download", "sync") or core.dry_run or core.report_only
+        )
 
         # 2. Личный чат — всегда разрешено
         if chat.type == ChatType.PRIVATE:

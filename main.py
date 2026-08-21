@@ -206,9 +206,7 @@ async def main(args: Namespace) -> None:
             if args.command == "sync":
                 identifiers = [args.chat] if args.chat else settings.core.chat_list
                 if not identifiers:
-                    log.error(
-                        "Нечего синхронизировать: чат не указан, а core.chat_list пуст."
-                    )
+                    log.error("Нечего синхронизировать: чат не указан, а core.chat_list пуст.")
                     return
 
                 resolved_ids = await resolve_chat_identifiers(app, identifiers)
