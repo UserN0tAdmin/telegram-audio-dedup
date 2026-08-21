@@ -4,8 +4,8 @@ from pathlib import Path
 
 from fakes import FakeClient, make_chat
 
+from dedup.cleaning import clean_filename
 from dedup.context import get_settings
-from dedup.fuzzy import clean_filename
 
 
 def test_package_imports_and_settings_are_active():

@@ -3,6 +3,11 @@
 Скоринг всегда ``token_set_ratio`` независимо от ``matching_mode`` конфига —
 это настройка строгости дедупликации, а поиску нужен recall. Флаг ``--wratio``
 переключает на WRatio (партиал-совпадения, сжатая шкала).
+
+Имена и мета индексируются в двух вариантах (см. :mod:`dedup.cleaning`):
+дедуп-очистка ``clean_filename`` для обычных запросов и лёгкая нормализация
+``clean_for_search``, сохраняющая сайты-качалки, домены, расширения и ID —
+по этому «мусору» тоже можно искать.
 """
 
 import asyncio
@@ -14,8 +19,14 @@ import numpy as np
 from rapidfuzz import fuzz, process
 from wcwidth import wcswidth
 
+from .cleaning import (
+    clean_filename,
+    clean_for_search,
+    clean_meta,
+    clean_meta_for_search,
+    process_for_fuzzy,
+)
 from .context import get_settings
-from .fuzzy import clean_filename, clean_meta, process_for_fuzzy
 from .logger import log
 from .state import chat_label
 from .typedefs import DBRow
@@ -35,9 +46,13 @@ def rank_rows(
 ) -> list[tuple[float, DBRow]]:
     """Ранжирует строки таблицы ``audios`` по схожести с запросом.
 
-    Каждая строка представлена двумя вариантами текста — очищенным именем
-    файла и очищенными метаданными (``performer+title``); итоговая оценка —
-    максимум по вариантам. Работает синхронно: вызывать через
+    Каждая строка представлена до четырёх вариантов текста: имя и мета
+    (``performer+title``) в двух формах — дедуп-очистка
+    (``clean_filename``/``clean_meta``) и лёгкая поисковая нормализация
+    (``clean_for_search``/``clean_meta_for_search``), сохраняющая сайты,
+    расширения и ID; итоговая оценка — максимум по вариантам. Запрос
+    нормализуется той же лёгкой чисткой, поэтому ``zaycev.net`` и
+    ``zaycev_net`` эквивалентны. Работает синхронно: вызывать через
     ``asyncio.to_thread``.
 
     Скорер — всегда ``token_set_ratio`` (настройки дедупликации не влияют);
@@ -54,21 +69,27 @@ def rank_rows(
         Не более ``result_limit`` пар ``(score, row)`` со схожестью
         не ниже ``score_cutoff``, по убыванию score.
     """
-    q = process_for_fuzzy(query)
+    q = process_for_fuzzy(clean_for_search(query))
     if not q or not rows:
         return []
 
     variant_texts: list[str] = []
     variant_rows: list[int] = []
     for i, row in enumerate(rows):
-        name = process_for_fuzzy(clean_filename(row["file_name"]))
-        if name:
-            variant_texts.append(name)
-            variant_rows.append(i)
-        meta = process_for_fuzzy(clean_meta(row["performer"], row["title"]))
-        if meta:
-            variant_texts.append(meta)
-            variant_rows.append(i)
+        # dict.fromkeys убирает дубли вариантов (легко нормализованная
+        # мета без «мусора» совпадает с дедуп-очищенной).
+        for cleaned in dict.fromkeys(
+            (
+                clean_for_search(row["file_name"]),
+                clean_filename(row["file_name"]),
+                clean_meta_for_search(row["performer"], row["title"]),
+                clean_meta(row["performer"], row["title"]),
+            )
+        ):
+            processed = process_for_fuzzy(cleaned)
+            if processed:
+                variant_texts.append(processed)
+                variant_rows.append(i)
 
     if not variant_texts:
         return []

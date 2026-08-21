@@ -3,7 +3,7 @@
 import pytest
 from helpers import CHAT_ID, SEED_ROWS, groups_as_partition, make_row
 
-from dedup.fuzzy import group_audios_fuzzy_optimized
+from dedup.fuzzy import group_audios_fuzzy_optimized, src_suffix
 
 
 @pytest.fixture
@@ -20,6 +20,20 @@ def fuzzy_runner(configure_settings):
 
 def test_empty_input_returns_empty(fuzzy_runner):
     assert fuzzy_runner([]) == ([], {})
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        (0, "(имя-имя)"),
+        (1, "(имя-мета)"),
+        (2, "(мета-имя)"),
+        (3, "(мета-мета)"),
+        (None, ""),
+    ],
+)
+def test_src_suffix(src, expected):
+    assert src_suffix(src) == expected
 
 
 def test_uid_duplicates_grouped_even_with_different_names(fuzzy_runner):

@@ -9,8 +9,8 @@ from typing import Any, Final
 
 import aiosqlite
 
+from .cleaning import clean_filename, clean_meta, process_for_fuzzy
 from .context import get_settings
-from .fuzzy import clean_filename, clean_meta, process_for_fuzzy
 from .logger import log
 from .state import chat_label
 from .typedefs import ChatID, CsvRowFormatter, DBRow, RowFormatter

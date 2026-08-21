@@ -1,8 +1,14 @@
-"""Юнит-тесты очистки имён и меты (dedup.fuzzy): чистые функции без I/O."""
+"""Юнит-тесты нормализации имён и меты (dedup.cleaning): чистые функции без I/O."""
 
 import pytest
 
-from dedup.fuzzy import clean_filename, clean_meta, process_for_fuzzy, src_suffix
+from dedup.cleaning import (
+    clean_filename,
+    clean_for_search,
+    clean_meta,
+    clean_meta_for_search,
+    process_for_fuzzy,
+)
 
 
 @pytest.mark.parametrize(
@@ -68,14 +74,34 @@ def test_process_for_fuzzy_normalizes(raw, expected):
 
 
 @pytest.mark.parametrize(
-    ("src", "expected"),
+    ("raw", "expected"),
     [
-        (0, "(имя-имя)"),
-        (1, "(имя-мета)"),
-        (2, "(мета-имя)"),
-        (3, "(мета-мета)"),
+        # «Мусор» из clean_filename здесь сохраняется — по нему тоже ищут
+        ("zaycev_net_Song.mp3", "zaycev net song mp3"),
+        ("Song_Name [muzlome.com].mp3", "song name muzlome com mp3"),
+        ("www.site.com_Song.mp3", "www site com song mp3"),
+        ("Powerful_T_-_Face_The_Race_72716591.mp3", "powerful t face the race 72716591 mp3"),
+        ("Track (1).mp3", "track 1 mp3"),
+        ("https://x.y/Song.flac", "https x y song flac"),
+        # Пунктуация между буквами не склеивается в один токен
+        ("song.mp3", "song mp3"),
+        ("Song Name", "song name"),
+        ("", ""),
         (None, ""),
     ],
 )
-def test_src_suffix(src, expected):
-    assert src_suffix(src) == expected
+def test_clean_for_search_keeps_junk(raw, expected):
+    assert clean_for_search(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("performer", "title", "expected"),
+    [
+        ("<unknown>", "Title", "title"),  # плейсхолдер отброшен
+        ("[unknown]", "<UNKNOWN>", ""),
+        ("Artist", "Song.mp3", "artist song mp3"),  # расширение сохранено
+        (None, None, ""),
+    ],
+)
+def test_clean_meta_for_search_placeholders_and_junk(performer, title, expected):
+    assert clean_meta_for_search(performer, title) == expected

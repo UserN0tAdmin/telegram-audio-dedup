@@ -114,6 +114,39 @@ def test_rank_rows_empty_query_or_rows():
     assert rank_rows("song", []) == []
 
 
+def test_rank_rows_finds_by_trash_site():
+    # Лёгкий вариант индекса сохраняет сайты: запрос «zaycev» находит файлы
+    # сайта-качалки (дедуп-чистка вырезала бы префикс начисто)
+    rows = [
+        make_row(1, "zaycev_net_Pesnya.mp3", 1_000_000, 100),
+        make_row(2, "Other Song.mp3", 1_000_000, 100),
+    ]
+    results = rank_rows("zaycev", rows)
+    assert [r[1]["message_id"] for r in results] == [1]
+
+
+def test_rank_rows_query_with_domain_normalized():
+    # Точка в запросе не склеивается в один токен: «zaycev.net» == «zaycev_net»
+    rows = [make_row(1, "zaycev_net_Pesnya.mp3", 1_000_000, 100)]
+    assert rank_rows("zaycev.net", rows)[0][1]["message_id"] == 1
+
+
+def test_rank_rows_finds_by_extension():
+    # Расширение — такой же токен индекса: им можно фильтровать формат
+    rows = [
+        make_row(1, "Same Song.mp3", 1_000_000, 100),
+        make_row(2, "Same Song.flac", 2_000_000, 100),
+    ]
+    assert [r[1]["message_id"] for r in rank_rows("flac", rows)] == [2]
+    assert [r[1]["message_id"] for r in rank_rows("mp3", rows)] == [1]
+
+
+def test_rank_rows_normal_query_score_not_diluted_by_junk():
+    # Обычному запросу мусор не мешает: дедуп-вариант даёт полные 100
+    rows = [make_row(1, "zaycev_net_Pesnya.mp3", 1_000_000, 100)]
+    assert rank_rows("pesnya", rows)[0][0] == 100
+
+
 async def test_run_search_missing_db_logs_critical(caplog):
     # БД из дефолтных настроек не существует — критичное сообщение, не исключение
     with caplog.at_level(logging.CRITICAL):

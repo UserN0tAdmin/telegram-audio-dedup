@@ -3,8 +3,8 @@
 from collections.abc import Callable
 from typing import Final, NamedTuple
 
+from .cleaning import clean_filename
 from .context import get_settings
-from .fuzzy import clean_filename
 from .settings import KEEP_CRITERIA_VALID
 from .typedefs import DBRow, DuplicateGroup
 
