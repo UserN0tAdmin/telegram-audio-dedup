@@ -26,6 +26,7 @@ archive_before_delete = true
 archive_target = me
 archive_mode = copy
 archive_hide_sender = false
+archive_send_header = false
 abort_delete_on_archive_failure = true
 
 [fuzzy_matching]
@@ -109,6 +110,7 @@ def test_full_valid_config(isolated_env):
 
     assert settings.archive.archive_before_delete is True
     assert settings.archive.archive_mode == "copy"
+    assert settings.archive.archive_send_header is False
 
     assert settings.fuzzy.enable is True
     assert settings.fuzzy.threshold == pytest.approx(0.85)

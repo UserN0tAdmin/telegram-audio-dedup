@@ -68,6 +68,7 @@ def make_settings(tmp_path):
                 archive_target="me",
                 archive_mode="forward",
                 archive_hide_sender=False,
+                archive_send_header=True,
                 abort_delete_on_archive_failure=True,
             ),
             "fuzzy": FuzzySettings(

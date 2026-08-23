@@ -124,6 +124,30 @@ async def test_handle_database_changes_deletes_and_archives(seeded_db, configure
     assert 1 not in remaining and 2 not in remaining and 7 not in remaining
 
 
+async def test_archive_header_disabled_skips_separator(seeded_db, configure_settings):
+    configure_settings(
+        core={"dry_run": False},
+        archive={"archive_before_delete": True, "archive_send_header": False},
+    )
+    client = FakeClient()
+
+    await handle_database_changes(
+        client,
+        CHAT_ID,
+        seeded_db,
+        tg_ids=[1, 2],
+        db_delete_ids=[],
+        db_update_records=[],
+        archive_target_id=-1007777000000,
+    )
+
+    assert "send_message" not in client.calls  # заголовок не шлётся
+    assert "forward_messages" in client.calls  # архивация и удаление работают
+    assert "delete_messages" in client.calls
+    remaining = await remaining_ids(seeded_db)
+    assert 1 not in remaining and 2 not in remaining
+
+
 async def test_archive_failure_aborts_delete(seeded_db, configure_settings):
     configure_settings(
         core={"dry_run": False},

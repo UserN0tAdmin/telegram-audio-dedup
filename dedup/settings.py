@@ -55,6 +55,7 @@ KNOWN_OPTIONS: Final[dict[str, frozenset[str] | None]] = {
             "archive_target",
             "archive_mode",
             "archive_hide_sender",
+            "archive_send_header",
             "abort_delete_on_archive_failure",
         }
     ),
@@ -183,6 +184,7 @@ class ArchiveSettings:
         archive_target: Куда архивировать (``'me'`` — Избранное).
         archive_mode: ``'forward'`` или ``'copy'``.
         archive_hide_sender: Скрывать автора при forward.
+        archive_send_header: Слать текстовый разделитель перед батчами чата.
         abort_delete_on_archive_failure: Пропускать удаление, если архивация не удалась.
     """
 
@@ -190,6 +192,7 @@ class ArchiveSettings:
     archive_target: str
     archive_mode: str
     archive_hide_sender: bool
+    archive_send_header: bool
     abort_delete_on_archive_failure: bool
 
 
@@ -630,6 +633,7 @@ def load_config(
         archive_target=config.get("archive", "archive_target", fallback="me").strip(),
         archive_mode=archive_mode_raw if archive_mode_raw in ("forward", "copy") else "forward",
         archive_hide_sender=config.getboolean("archive", "archive_hide_sender", fallback=False),
+        archive_send_header=config.getboolean("archive", "archive_send_header", fallback=True),
         abort_delete_on_archive_failure=config.getboolean(
             "archive", "abort_delete_on_archive_failure", fallback=True
         ),

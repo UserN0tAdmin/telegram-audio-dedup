@@ -140,6 +140,7 @@ async def _send_archive_header(
     """Шлёт в архив текстовый разделитель перед пересылкой батчей чата.
 
     Косметика: падение заголовка не должно останавливать архивацию.
+    Вызывается только при ``archive_send_header = True``.
 
     Args:
         app: Клиент Telegram.
@@ -242,8 +243,7 @@ async def _archive_and_delete_messages(
         f"(архивация: {'вкл' if archive_enabled else 'выкл'})..."
     )
 
-    if archive_enabled:
-        # todo сделать отключаемым
+    if archive_enabled and cfg.archive.archive_send_header:
         await _send_archive_header(app, archive_target_id, chat_id, len(tg_ids))
 
     batches = list(itertools.batched(tg_ids, cfg.performance.batch_delete_size))
