@@ -43,7 +43,7 @@ async def create_telegram_client() -> Client | None:
         "no_updates": True,
         "max_concurrent_transmissions": 10,
         "sleep_threshold": p.sleep_threshold,
-        # "protocol_factory": TCPPadded, # todo в конфиг вынести
+        # "protocol_factory": TCPIntermediatePadded, # todo в конфиг вынести
     }
 
     if p.proxy_url:
@@ -87,7 +87,7 @@ async def create_telegram_client() -> Client | None:
                     f"Не удалось распарсить URL прокси. Проверьте правильность ссылки в конфиге. Ошибка: {e}"
                 )
                 return None
-
+    # todo любые параметры клиента из конфига
     return Client(p.session_name, **client_kwargs)
 
 
