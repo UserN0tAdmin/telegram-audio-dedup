@@ -131,6 +131,7 @@ def _uid_prepass(
     Returns:
         Количество добавленных UID-связей.
     """
+    # todo проверять также и имя файла, титле и перформер
     uid_groups: defaultdict[str, list[int]] = defaultdict(list)
     for idx, uid in enumerate(uids):
         if uid:
@@ -335,7 +336,6 @@ def _filter_already_connected(
         Отфильтрованные ``abs_indices``, ``valid_indices_relative`` и
         количество пропущенных кандидатов.
     """
-    # todo проверять также и имя файла, титле и перформер
     if not adjacency_i:
         return abs_indices, valid_indices_relative, 0
 
