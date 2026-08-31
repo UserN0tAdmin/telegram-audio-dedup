@@ -14,6 +14,7 @@ backup/
 exports/
 log/
 downloads/
+tests/golden/
 
 # Python
 dedup.egg-info/

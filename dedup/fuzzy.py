@@ -23,7 +23,7 @@ from .typedefs import DBRow, DuplicateGroup, EdgeInfo, EdgeMeta, edge_key
 _RE_DIGITS = re.compile(r"\d+")
 
 # region --- Подфункции fuzzy-матчера ---
-
+# todo добавить постфильтрациию графа, для разбиения слабых групп
 
 # Источники текстового совпадения: имя-имя, имя-мета, мета-имя, мета-мета
 _SRC_NN, _SRC_NM, _SRC_MN, _SRC_MM = 0, 1, 2, 3
