@@ -83,16 +83,16 @@ python main.py --set paths.exports_dir=/tmp/exp export filenames 123
 следующий сужает круг «равных», оставшихся после предыдущего:
 
 ```ini
-keep_priority = largest ~ 3%, best_meta, oldest
+keep_priority = largest ~ 2%, best_meta, oldest
 ```
 
 | Критерий | Сравнивает | Допуск `~N%` |
-|---|---|---|
-| `oldest` / `newest` | `message_id` (меньше = раньше опубликовано) | запрещён |
-| `largest` / `smallest` | размер файла | можно |
-| `longest` / `shortest` | длительность | можно |
-| `best_meta` | качество тегов, 0–2 балла (см. ниже) | запрещён |
-| `longest_clean_name` | длину имени файла после очистки от мусора | можно |
+|---|---|--------------|
+| `oldest` / `newest` | `message_id` (меньше = раньше опубликовано) | запрещён     |
+| `largest` / `smallest` | размер файла | разрешён     |
+| `longest` / `shortest` | длительность | разрешён        |
+| `best_meta` | качество тегов, 0–2 балла (см. ниже) | запрещён     |
+| `longest_clean_name` | длину имени файла после очистки от мусора | разрешён        |
 
 Как работает один уровень каскада:
 
