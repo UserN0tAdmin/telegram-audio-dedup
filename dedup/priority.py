@@ -88,7 +88,7 @@ _KEEP_CRITERIA: Final[dict[str, KeepCriterion]] = {
 
 # Ловим рассинхрон реестра и валидации конфига на импорте, а не в рантайме
 assert set(_KEEP_CRITERIA) == KEEP_CRITERIA_VALID, (
-    "Реестр критериев priority.py разошёлся с KEEP_CRITERIA_VALID в config.py"
+    "Реестр критериев priority.py разошёлся с KEEP_CRITERIA_VALID в settings.py"
 )
 
 
