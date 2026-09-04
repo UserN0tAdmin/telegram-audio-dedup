@@ -7,8 +7,6 @@ from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
-from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
-
 # Используется kurigram
 from pyrogram import Client, types
 from pyrogram.connection.transport.tcp import TCPAbridged, TCPIntermediatePadded
@@ -29,6 +27,44 @@ from .typedefs import AudioMeta, ChatID, MessageID
 # Самый большой блок, содержащий всю "умную" часть скрипта: получение сообщений из Telegram, их анализ, поиск дубликатов и выполнение действий.
 
 
+# todo удалить целиком, когда kurigram обновится
+async def _try_setup_mtproxy_bridge(proxy_url: str, client_kwargs: dict[str, Any]) -> bool | None:
+    """Пробует поднять локальный мост для MTProto-ссылки.
+
+    Args:
+        proxy_url: Значение ``proxy_url`` из конфига.
+        client_kwargs: Аргументы для ``Client``, дополняются на месте при успехе.
+
+    Returns:
+        ``True`` — мост поднят, ``False`` — не MTProto/нет либы (идти в обычную
+        ветку «как есть»), ``None`` — фатальная ошибка (вызывающий возвращает ``None``).
+    """
+    try:
+        from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
+    except ImportError:
+        log.debug("mtproxy-bridge не установлен — proxy_url передаётся как есть.")
+        return False
+    if not is_mtproto_link(proxy_url):
+        return False
+    try:
+        local_port = await start_local_bridge(proxy_url)
+        transport = TCPIntermediatePadded if needs_padded_transport(proxy_url) else TCPAbridged
+        client_kwargs["proxy"] = {
+            "scheme": "socks5",
+            "hostname": "127.0.0.1",
+            "port": local_port,
+        }
+        client_kwargs["protocol_factory"] = transport
+        log.info(
+            "MTProto-прокси из конфига поднят как локальный мост: "
+            f"127.0.0.1:{local_port} -> {proxy_url.split('server=')[-1].split('&')[0]}"
+        )
+        return True
+    except Exception as e:
+        log.critical(f"Не удалось поднять локальный мост для MTProto-прокси. Ошибка: {e}")
+        return None
+
+
 async def create_telegram_client() -> Client | None:
     """Создает, настраивает и возвращает экземпляр клиента Kurigram.
 
@@ -47,27 +83,12 @@ async def create_telegram_client() -> Client | None:
     }
 
     if p.proxy_url:
-        if is_mtproto_link(p.proxy_url):
-            try:
-                local_port = await start_local_bridge(p.proxy_url)
-                transport = (
-                    TCPIntermediatePadded if needs_padded_transport(p.proxy_url) else TCPAbridged
-                )
-                client_kwargs["proxy"] = {
-                    "scheme": "socks5",
-                    "hostname": "127.0.0.1",
-                    "port": local_port,
-                }
-                client_kwargs["protocol_factory"] = transport
+        # удалить эти 4 строки вместе с хелпером выше.
+        bridge_result = await _try_setup_mtproxy_bridge(p.proxy_url, client_kwargs)
+        if bridge_result is None:
+            return None
+        if not bridge_result:
 
-                log.info(
-                    f"MTProto-прокси из конфига поднят как локальный мост: "
-                    f"127.0.0.1:{local_port} -> {p.proxy_url.split('server=')[-1].split('&')[0]}"
-                )
-            except Exception as e:
-                log.critical(f"Не удалось поднять локальный мост для MTProto-прокси. Ошибка: {e}")
-                return None
-        else:
             try:
                 parsed_proxy = urlparse(p.proxy_url)
                 proxy_dict = {

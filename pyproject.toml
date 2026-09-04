@@ -21,9 +21,13 @@ dependencies = [
     "rapidfuzz>=3.14.5",
     "tgcrypto-pyrofork>=1.2.8",
     "wcwidth>=0.8.2",
-    "mtproxy-bridge @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@0.3.4",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",
     "winloop>=0.5.0 ; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+mtproxy = [
+    "mtproxy-bridge @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@0.3.4",
 ]
 
 # Инструменты разработки; установка: pip install -e . --group dev (pip >= 25.1)
@@ -61,10 +65,12 @@ module = [
 ]
 ignore_missing_imports = true
 
-# main.py остаётся точкой входа репозитория (python main.py) и в пакет не ставится
 [tool.setuptools]
 packages = ["dedup"]
-py-modules = []
+py-modules = ["main"]
+
+[project.scripts]
+dedup = "main:_bootstrap"
 
 [tool.ruff]
 line-length = 100

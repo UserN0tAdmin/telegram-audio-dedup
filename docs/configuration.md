@@ -234,7 +234,7 @@ Regex-защита: сообщение 4660 ('Король и Шут') совп�
 |---|---|---|
 | `api_id`, `api_hash` | *(пусто)* | Креды с my.telegram.org. Лучше держать в `.env` (`TG_API_ID`/`TG_API_HASH` приоритетнее) |
 | `session_name` | `my_account` | База имени файла сессии (`my_account.session`, `my_account.lock`) |
-| `proxy_url` | *(пусто)* | Прокси: `socks5://user:pass@host:port`, `http://...` или MTProto-ссылка `t.me/proxy?...` — её скрипт сам превращает в локальный SOCKS5-мост |
+| `proxy_url` | *(пусто)* | Прокси: `socks5://user:pass@host:port`, `http://...` или MTProto-ссылка `t.me/proxy?...` — мост требует `pip install -e .[mtproxy]`, без него ссылка идёт как есть |
 | `sleep_threshold` | `300` | Сколько секунд клиент ждёт FloodWait автоматически, дольше — исключение |
 
 ## `[archive]` — архивация перед удалением
