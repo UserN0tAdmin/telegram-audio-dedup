@@ -48,7 +48,7 @@ cp config.example.cfg config.cfg   # Windows: copy config.example.cfg config.cfg
 python main.py report
 ```
 
-### Также можно просто командой `dedup`
+### Также можно просто командой `dedup`, но сессия создастся не корне, а в venv
 
 `report` ничего не удаляет: синхронизирует чаты в локальную БД и складывает
 в `exports/` наглядные отчёты о найденных дубликатах. Для боевого прогона
