@@ -76,7 +76,7 @@ python main.py report
 `<чат>` — числовой ID, `@username` или ссылка `t.me`. Любую опцию
 `config.cfg` можно перекрыть на один запуск аргументами: `--dry-run`,
 `--chat`, `--threshold` или универсальным
-`--set SECTION.OPTION=VALUE` (например, `python main.py --no-dry-run --chat @music`);
+`--set SECTION.OPTION=VALUE` (например, `python main.py --no-dry-run --chat @music_shiz`);
 справочник — [docs/configuration.md](docs/configuration.md#перекрытие-аргументами-командной-строки).
 Полное описание команд с примерами и типичными сценариями: [docs/usage.md](docs/usage.md).
 
@@ -99,7 +99,7 @@ python main.py report
 - **Зависимости**: kurigram (форк pyrogram), rapidfuzz, numpy, aiosqlite,
   openpyxl, fasteners, python-dotenv, uvloop/winloop. Единый манифест —
   `pyproject.toml`: зависимости и dev-группа (pytest, ruff, mypy и т.п. —
-  `pip install --group dev`).
+  `pip install -e . --group dev`).
 - **Язык**: код, докстринги, логи и документация — на русском.
 
 ## Осторожно

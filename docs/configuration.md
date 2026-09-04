@@ -46,7 +46,7 @@ config.cfg` (полностью прокомментирован) — дальш
 - при конфликте `--set` приоритетнее сахарных флагов; несколько `--set` на
   один ключ — побеждает последний;
 - ключи `[ignore_list]`/`[ignore_regex]` свободные (ID чата или `*`):
-  `--set ignore_list.-1001234567890=4973,4660`; многострочные значения
+  `--set ignore_list.-1001986217699=4973,4660`; многострочные значения
   `[ignore_regex]` из CLI задать нельзя — только однострочный паттерн;
 - неизвестная секция/опция — выход с кодом 2 со списком допустимых ключей;
   остальная валидация и клампинг — те же, что для файла;
@@ -56,8 +56,8 @@ config.cfg` (полностью прокомментирован) — дальш
 Примеры:
 
 ```bash
-python main.py --dry-run --chat @music                    # симуляция по одному чату
-python main.py --no-dry-run --chat -1001234567890         # бой по одному чату
+python main.py --dry-run --chat @music_shiz                    # симуляция по одному чату
+python main.py --no-dry-run --chat -1001986217699         # бой по одному чату
 python main.py --set fuzzy_matching.enable=true report    # fuzzy на один report
 python main.py search "запрос" --set logging.log_level_console=DEBUG
 python main.py --threshold 0.85 --set core.report_only=true

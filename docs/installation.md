@@ -21,7 +21,7 @@ pip install -e .
 
 ```bash
 python -m pip install -U pip       # нужен pip >= 25.1, если venv свежий со старым pip
-pip install --group dev
+pip install -e . --group dev
 ```
 
 На Linux/macOS ставится `uvloop`, на Windows — `winloop`: скрипт подхватывает
@@ -62,7 +62,7 @@ TG_API_HASH=0123456789abcdef0123456789abcdef
 
 ```ini
 [core]
-chat_list = -1001234567890, @some_music_chat
+chat_list = -1001986217699, @music_shiz
 
 [fuzzy_matching]
 enable = True
