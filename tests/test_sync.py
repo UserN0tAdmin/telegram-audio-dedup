@@ -24,6 +24,22 @@ async def test_flush_audio_batch_inserts_and_ignores_duplicates(fresh_db):
         assert (await c.fetchone())[0] == 3
 
 
+async def test_flush_audio_batch_upsert_refreshes_stale_row(fresh_db):
+    await fresh_db.execute(
+        "INSERT INTO audios VALUES (?, 1, 'OLD', 'old.mp3', 100, 10, 'Old', 'Name')",
+        (CHAT_ID,),
+    )
+    await fresh_db.commit()
+    fresh = [(CHAT_ID, 1, "NEW", "new.mp3", 200, 20, "New", "Title")]
+    assert await _flush_audio_batch(fresh_db, fresh, upsert=True) == 1
+    async with fresh_db.execute(
+        "SELECT file_unique_id, file_name, file_size, duration, performer, title"
+        " FROM audios WHERE chat_id = ? AND message_id = 1",
+        (CHAT_ID,),
+    ) as c:
+        assert tuple(await c.fetchone()) == ("NEW", "new.mp3", 200, 20, "New", "Title")
+
+
 def build_history():
     return [
         make_message(1, file_name="song1.mp3", uid="S1", file_size=1000, duration=101),
@@ -129,6 +145,29 @@ async def test_sync_messages_force_ignores_cursor_and_keeps_rows(fresh_db):
         synced, newest = await c.fetchone()
     assert synced == 1
     assert newest == 6
+
+
+async def test_sync_messages_force_refreshes_stale_metadata(fresh_db):
+    await fresh_db.execute("INSERT INTO chat_sync_state VALUES (?, 1, 3)", (CHAT_ID,))
+    # Stale-строка: тот же PK (chat_id, 1), но устаревшая мета
+    await fresh_db.execute(
+        "INSERT INTO audios VALUES (?, 1, 'OLD', 'old.mp3', 111, 11, 'Old', 'Name')",
+        (CHAT_ID,),
+    )
+    await fresh_db.commit()
+
+    client = FakeClient()
+    client.history = build_history()
+    await sync_messages(client, CHAT_ID, fresh_db, force=True)
+
+    async with fresh_db.execute(
+        "SELECT file_unique_id, file_name, file_size, duration FROM audios"
+        " WHERE chat_id = ? AND message_id = 1",
+        (CHAT_ID,),
+    ) as c:
+        assert tuple(await c.fetchone()) == ("S1", "song1.mp3", 1000, 101)
+    async with fresh_db.execute("SELECT COUNT(*) FROM audios") as c:
+        assert (await c.fetchone())[0] == 4  # обновилась, не задвоилась
 
 
 async def test_sync_messages_force_on_virgin_database_is_full_scan(fresh_db):

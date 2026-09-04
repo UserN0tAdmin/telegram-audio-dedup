@@ -17,20 +17,40 @@ from .typedefs import ChatID
 async def _flush_audio_batch(
     conn: aiosqlite.Connection,
     batch: list[tuple],
+    *,
+    upsert: bool = False,
 ) -> int:
     """Вставляет батч аудио и коммитит.
 
     Args:
         conn: Соединение с БД.
         batch: Список кортежей со значениями колонок ``audios``.
+        upsert: ``False`` — ``INSERT OR IGNORE`` (быстрый инкрементальный
+            путь, конфликты по ``PK(chat_id, message_id)`` пропускаются);
+            ``True`` — upsert: совпавшие строки безусловно перезаписываются
+            свежими данными (все 6 полей, включая NULL как истину).
 
     Returns:
-        Число реально вставленных строк (``INSERT OR IGNORE``).
+        Число затронутых строк (вставленных; при ``upsert=True`` — включая
+        обновлённые, в т.ч. с идентичными значениями).
     """
-    cur = await conn.executemany(
-        "INSERT OR IGNORE INTO audios (chat_id, message_id, file_unique_id, file_name, file_size, duration, performer, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        batch,
-    )
+    if upsert:
+        cur = await conn.executemany(
+            "INSERT INTO audios (chat_id, message_id, file_unique_id, file_name, file_size, duration, performer, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(chat_id, message_id) DO UPDATE SET"
+            " file_unique_id = excluded.file_unique_id,"
+            " file_name = excluded.file_name,"
+            " file_size = excluded.file_size,"
+            " duration = excluded.duration,"
+            " performer = excluded.performer,"
+            " title = excluded.title",
+            batch,
+        )
+    else:
+        cur = await conn.executemany(
+            "INSERT OR IGNORE INTO audios (chat_id, message_id, file_unique_id, file_name, file_size, duration, performer, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            batch,
+        )
     await conn.commit()
     return cur.rowcount
 
@@ -71,14 +91,16 @@ async def sync_messages(
     """Синхронизация: поиск AUDIO + DOCUMENT на серверах Telegram.
 
     Каждый батч коммитится отдельно; курсор обновляется только в конце;
-    ``INSERT OR IGNORE`` даёт идемпотентность.
+    ``INSERT OR IGNORE`` даёт идемпотентность, при ``force=True`` совпавшие
+    строки обновляются свежими данными (upsert).
 
     Args:
         app: Клиент Telegram.
         chat_id: ID синхронизируемого чата.
         conn: Соединение с БД.
         force: Полный перескан с нуля вместо инкрементального режима
-            (курсор игнорируется, существующие строки сохраняются).
+            (курсор игнорируется, существующие строки обновляются свежими
+            данными вместо пропуска).
 
     Raises:
         Exception: Любая ошибка синхронизации — транзакция откатывается
@@ -153,7 +175,7 @@ async def sync_messages(
 
                 # --- батч заполнен → коммитим ---
                 if len(batch) >= get_settings().performance.sync_batch_size:
-                    added = await _flush_audio_batch(conn, batch)
+                    added = await _flush_audio_batch(conn, batch, upsert=force)
                     filter_added += added
                     total_added += added
                     batch.clear()
@@ -171,7 +193,7 @@ async def sync_messages(
 
             # --- остаток ---
             if batch:
-                added = await _flush_audio_batch(conn, batch)
+                added = await _flush_audio_batch(conn, batch, upsert=force)
                 filter_added += added
                 total_added += added
                 batch.clear()
