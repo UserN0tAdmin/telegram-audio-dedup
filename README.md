@@ -48,6 +48,8 @@ cp config.example.cfg config.cfg   # Windows: copy config.example.cfg config.cfg
 python main.py report
 ```
 
+### Также можно просто командой `dedup`
+
 `report` ничего не удаляет: синхронизирует чаты в локальную БД и складывает
 в `exports/` наглядные отчёты о найденных дубликатах. Для боевого прогона
 остаётся выключить `dry_run` (он по умолчанию включён как страховка). Все
