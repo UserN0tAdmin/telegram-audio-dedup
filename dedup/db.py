@@ -13,7 +13,7 @@ from .logger import log
 from .state import chat_label
 from .typedefs import AudioMeta, ChatID, MessageID
 
-# Этот блок отвечает за все прямое взаимодействие с файлом SQLite: инициализация, подключение, валидация, ремонт и простые запросы (получение ID).
+# Этот блок отвечает за все прямое взаимодействие с файлом SQLite: инициализация, подключение, валидация и ремонт.
 
 
 # todo Добавить версирование БД user_version

@@ -24,8 +24,6 @@ from .logger import log
 from .state import GLOBAL_IGNORE_REGEX, IGNORE_MESSAGES, IGNORE_REGEX, chat_label, remember_chat
 from .typedefs import AudioMeta, ChatID, MessageID
 
-# Самый большой блок, содержащий всю "умную" часть скрипта: получение сообщений из Telegram, их анализ, поиск дубликатов и выполнение действий.
-
 
 # todo удалить целиком, когда kurigram обновится
 async def _try_setup_mtproxy_bridge(proxy_url: str, client_kwargs: dict[str, Any]) -> bool | None:
