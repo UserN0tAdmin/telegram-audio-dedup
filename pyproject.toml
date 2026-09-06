@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mtproxy = [
-    "mtproxy-bridge @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@0.3.4",
+    "mtproxy-bridge @ git+https://github.com/UserN0tAdmin/mtproxy-bridge.git@0.3.5",
 ]
 
 # Инструменты разработки; установка: pip install -e . --group dev (pip >= 25.1)
