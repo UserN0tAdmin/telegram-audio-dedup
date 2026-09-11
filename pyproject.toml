@@ -39,6 +39,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "types-openpyxl>=3.1.5",
+    "mutmut>=3.7",
 ]
 
 [tool.pytest.ini_options]
@@ -95,3 +96,18 @@ convention = "google"
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.mutmut]
+source_paths = ["dedup"]
+only_mutate = [
+    "dedup/fuzzy.py",
+    "dedup/priority.py",
+    "dedup/cleaning.py",
+    "dedup/utils.py",
+    "dedup/duplicates.py",
+    "dedup/search.py",
+    "dedup/state.py",
+]
+cache_invalidation_files = ["tests/*.py"]
+on_dependency_change = "rerun"
+max_children = 6
