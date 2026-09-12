@@ -91,8 +91,21 @@ target-version = "py312"
 # PERF — перф-антипаттерны (ручной цикл вместо extend/comprehension);
 # PLE/PLW/PLC — pylint-наследие: ошибки, предупреждения, упрощения;
 # T10  — забытый pdb.set_trace.
+
+# PIE  — лишние pass/плейсхолдеры;
+# FURB — refurb: точечные упрощения (тернарник вместо or и т.п.);
+# RET  — superfluous-else-return и родственники;
+# PTH  — унификация на pathlib: open() → Path.open(), os.remove → unlink;
+# EXE  — exec-бит без шебанга (гигиена прав в git);
+# NPY  — NumPy;
+# N    — pep8-naming: camelCase-функции, PascalCase-переменные, битые алиасы
+#         импортов — страховка;
+# PGH  — голые `# noqa` / `# type: ignore` без кода правила;
+# PLR1730/PLR5501 — единственные взятые из PLR: пороговые PLR09xx/PLR2004. # todo рассмотреть весь PLR
 select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF", "D",
-          "ASYNC", "DTZ", "S", "PT", "PERF", "PLE", "PLW", "PLC", "T10"]
+          "ASYNC", "DTZ", "S", "PT", "PERF", "PLE", "PLW", "PLC", "T10",
+          "PIE", "FURB", "RET", "PTH", "EXE", "NPY", "N", "PGH",
+          "PLR1730", "PLR5501"]
 
 ignore = [
     # Длинные SQL-строки и лог-сообщения не рвём — форматировщик их всё равно не переносит.
@@ -104,12 +117,14 @@ ignore = [
     # плейсхолдерами передать нельзя, все ЗНАЧЕНИЯ ходят через «?».
     "S608",
     # Ленивые импорты — осознанно: optional-зависимости с ImportError-fallback
-    # (openpyxl, wcwidth, mtproxy-bridge), платформенные winloop/uvloop.
     "PLC0415",
     # Одиночные Path.exists()-стражи в async — микросекундный stat() на локальной ФС;
     # обёртка в to_thread стоила бы дороже самого вызова. Тяжёлые операции
     # (read_text, rglob, save) правило продолжает ловить.
     #"ASYNC240", # todo рассмотреть
+    # Локальные UPPER-константы внутри функций (W_NAME, CHUNK, EXCEL_MAX_*, ...)
+    # — осознанный стиль проекта: константа живёт рядом с единственным потребителем.
+    "N806",
 ]
 
 [tool.ruff.lint.pydocstyle]
