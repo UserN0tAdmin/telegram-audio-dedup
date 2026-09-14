@@ -25,7 +25,8 @@ from .state import GLOBAL_IGNORE_REGEX, IGNORE_MESSAGES, IGNORE_REGEX, chat_labe
 from .typedefs import AudioMeta, ChatID, MessageID
 
 
-# todo удалить целиком, когда kurigram обновится
+# NOTE: реализация web proxy в kurigram на момент версии 2.2.26 не подключилась ни к одному из серверов, протестированных мною, мост оставляю
+# NOTE: mtproxy же в 2.2.26 работает нормально
 async def _try_setup_mtproxy_bridge(proxy_url: str, client_kwargs: dict[str, Any]) -> bool | None:
     """Пробует поднять локальный мост для MTProto-ссылки.
 
@@ -38,11 +39,13 @@ async def _try_setup_mtproxy_bridge(proxy_url: str, client_kwargs: dict[str, Any
         ветку «как есть»), ``None`` — фатальная ошибка (вызывающий возвращает ``None``).
     """
     try:
-        from mtproxy_bridge import is_mtproto_link, needs_padded_transport, start_local_bridge
+        from mtproxy_bridge import is_web_proxy_link, needs_padded_transport, start_local_bridge
     except ImportError:
-        log.debug("mtproxy-bridge не установлен — proxy_url передаётся как есть.")
+        log.debug(
+            "mtproxy-bridge не установлен — proxy_url передаётся как есть. Web Proxy возможно не поднимется"
+        )
         return False
-    if not is_mtproto_link(proxy_url):
+    if not is_web_proxy_link(proxy_url):
         return False
     try:
         local_port = await start_local_bridge(proxy_url)
@@ -81,32 +84,20 @@ async def create_telegram_client() -> Client | None:
     }
 
     if p.proxy_url:
-        # удалить эти 4 строки вместе с хелпером выше.
         bridge_result = await _try_setup_mtproxy_bridge(p.proxy_url, client_kwargs)
         if bridge_result is None:
             return None
         if not bridge_result:
-
+            client_kwargs["proxy"] = p.proxy_url
             try:
                 parsed_proxy = urlparse(p.proxy_url)
-                proxy_dict = {
-                    "scheme": parsed_proxy.scheme,
-                    "hostname": parsed_proxy.hostname,
-                    "port": parsed_proxy.port,
-                    "username": parsed_proxy.username,
-                    "password": parsed_proxy.password,
-                }
-                client_kwargs["proxy"] = proxy_dict
-
-                log.info(
-                    f"Используется прокси: {proxy_dict['scheme']}://{proxy_dict['hostname']}:{proxy_dict['port']}"
-                )
+                log.info(f"Используется прокси со схемой: {parsed_proxy.scheme}")
             except Exception as e:
                 log.critical(
                     f"Не удалось распарсить URL прокси. Проверьте правильность ссылки в конфиге. Ошибка: {e}"
                 )
                 return None
-    # todo любые параметры клиента из конфига
+    # todo любые параметры клиента из конфига (как раз закроет todo выше)
     return Client(p.session_name, **client_kwargs)
 
 
