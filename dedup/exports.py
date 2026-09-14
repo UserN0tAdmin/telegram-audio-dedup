@@ -394,8 +394,7 @@ async def export_database_to_xlsx(chat_id: ChatID) -> None:
                         val_len = 18
                     else:
                         val_len = len(str(val))
-                    if val_len > max_len:
-                        max_len = val_len
+                    max_len = max(max_len, val_len)
                 except Exception:
                     continue
 

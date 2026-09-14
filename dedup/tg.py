@@ -58,7 +58,7 @@ async def _try_setup_mtproxy_bridge(proxy_url: str, client_kwargs: dict[str, Any
         client_kwargs["protocol_factory"] = transport
         log.info(
             "MTProto-прокси из конфига поднят как локальный мост: "
-            f"127.0.0.1:{local_port} -> {proxy_url.split('server=')[-1].split('&')[0]}"
+            f"127.0.0.1:{local_port} -> {proxy_url.rsplit('server=', maxsplit=1)[-1].split('&', maxsplit=1)[0]}"
         )
         return True
     except Exception as e:

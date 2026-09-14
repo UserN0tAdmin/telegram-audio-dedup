@@ -195,8 +195,7 @@ async def get_potential_duplicate_groups(
     if get_settings().fuzzy.enable:
         return await asyncio.to_thread(group_audios_fuzzy_optimized, all_audios)
         # return []
-    else:
-        return await asyncio.to_thread(_group_audios_by_duplicates, all_audios)
+    return await asyncio.to_thread(_group_audios_by_duplicates, all_audios)
 
 
 async def _verify_messages_from_api(

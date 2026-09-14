@@ -47,10 +47,9 @@ async def create_database_backup() -> None:
                         "Хэш-сумма БД не изменилась. Создание новой резервной копии пропущено."
                     )
                     return
-                else:
-                    log.info(
-                        "Обнаружены изменения в БД (хэш-суммы не совпадают). Создание бэкапа необходимо."
-                    )
+                log.info(
+                    "Обнаружены изменения в БД (хэш-суммы не совпадают). Создание бэкапа необходимо."
+                )
         except Exception as e:
             log.warning(
                 f"Не удалось проверить хэш-сумму БД. Ошибка: {e}. Бэкап будет создан для безопасности."
@@ -86,12 +85,11 @@ async def create_database_backup() -> None:
         if not cfg.backup.rotate_before_backup:
             log.info("Обычный режим: выполнение ротации после успешного создания бэкапа.")
             await _perform_rotation(source_db_path, backup_dir)
-    else:
-        # Если создание не удалось
-        if not cfg.backup.rotate_before_backup:
-            log.warning(
-                "Создание бэкапа не удалось. Ротация старых копий пропущена для безопасности."
-            )
+    # Если создание не удалось
+    elif not cfg.backup.rotate_before_backup:
+        log.warning(
+            "Создание бэкапа не удалось. Ротация старых копий пропущена для безопасности."
+        )
 
 
 async def _perform_backup_creation(
@@ -188,8 +186,7 @@ async def _perform_rotation(source_db_path: Path, backup_dir: Path) -> None:
                 )
 
             # Защита от отрицательных чисел (на всякий случай)
-            if target_hot_backups < 0:
-                target_hot_backups = 0
+            target_hot_backups = max(target_hot_backups, 0)
 
             backups = await asyncio.to_thread(
                 lambda: sorted(backup_dir.glob(f"{db_stem}_*.sqlite.bak"))

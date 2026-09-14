@@ -121,7 +121,7 @@ async def _download_worker(
 
         try:
             # --- 1. Подготовка имени файла ---
-            base_name = file_name if file_name else f"audio_{message.id}"
+            base_name = file_name or f"audio_{message.id}"
             safe_name = sanitize_filename(base_name)
 
             # Если расширения нет, пытаемся угадать по mime-type
@@ -132,7 +132,7 @@ async def _download_worker(
                 elif message.document:
                     mime = message.document.mime_type
                 guessed_ext = app.guess_extension(mime) if mime else None
-                safe_name += guessed_ext if guessed_ext else ".mp3"
+                safe_name += guessed_ext or ".mp3"
 
             final_path = download_dir / safe_name
 

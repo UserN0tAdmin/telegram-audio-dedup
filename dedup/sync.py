@@ -166,8 +166,7 @@ async def sync_messages(
             ):
                 scanned += 1
 
-                if message.id > max_id_found:
-                    max_id_found = message.id
+                max_id_found = max(max_id_found, message.id)
 
                 audio_attrs = get_audio_attributes(message)
                 if audio_attrs:
